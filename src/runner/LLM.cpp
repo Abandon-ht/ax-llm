@@ -1447,7 +1447,11 @@ struct LLM::Impl {
 #endif
 
             if (indices < mask.size()) mask[indices] = 0;
-            if (tokenizer->is_stop(next_token)) { b_hit_eos = true; break; }
+            static int end_count = 0;
+            if (tokenizer->is_stop(next_token)) {
+                end_count++;
+                if (end_count == 3) { b_hit_eos = true; break; }
+            }
             token_ids.push_back(next_token);
             if (_attr.runing_callback)
             {
