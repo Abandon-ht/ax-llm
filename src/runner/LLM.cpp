@@ -1332,6 +1332,7 @@ struct LLM::Impl {
             ALOGI("ttft: %.2f ms", ttft_timer.cost());
             if (_attr.runing_callback)
             {
+                printf("next_token: %d\n", next_token);
                 auto str = utf8_filter.filter(tokenizer->decode(next_token));
                 if (!str.empty()) _attr.runing_callback(str, -1, _attr.reserve);
             }
@@ -1456,6 +1457,8 @@ struct LLM::Impl {
             if (_attr.runing_callback)
             {
                 float t_ms  = t_cost.cost(); float tps   = token_ids.size() / (t_ms / 1000.0f);
+                fprintf(stdout, "%d, ", next_token);
+                fflush(stdout);
                 auto  str   = utf8_filter.filter(tokenizer->decode(next_token));
                 if (!str.empty()) _attr.runing_callback(str, tps, _attr.reserve);
             }

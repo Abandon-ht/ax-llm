@@ -109,8 +109,8 @@ static BOOL WINAPI __ConsoleCtrlHandler(DWORD ctrl_type)
 
 void llm_running_callback(std::string str, float token_per_sec, void *reserve)
 {
-    fprintf(stdout, "%s", str.c_str());
-    fflush(stdout);
+    // fprintf(stdout, "%s", str.c_str());
+    // fflush(stdout);
 }
 
 // Config structure for JSON configuration

@@ -169,9 +169,14 @@ if(BUILD_AX650)
         ${COMMON_SOURCES}
         src/runner/ax_model_runner/ax_model_runner_ax650.cpp
     )
+    add_executable(qwen3_tts_debug tools/qwen3_tts_debug.cpp
+        ${COMMON_SOURCES}
+        src/runner/ax_model_runner/ax_model_runner_ax650.cpp
+    )
     target_include_directories(axllm PRIVATE ${BSP_MSP_DIR}/include)
     target_include_directories(llm_smoke PRIVATE ${BSP_MSP_DIR}/include)
     target_include_directories(qwen3_asr_debug PRIVATE ${BSP_MSP_DIR}/include)
+    target_include_directories(qwen3_tts_debug PRIVATE ${BSP_MSP_DIR}/include)
     # link_directories 是全局的，用 target 属性更干净；CMake < 3.13 没有
     # target_link_directories，改用 set_target_properties 设置 LINK_FLAGS 或
     # 直接传绝对路径库目录给 target_link_libraries 的 -L 形式：
@@ -193,9 +198,16 @@ if(BUILD_AX650)
         pthread tokenizer openai_api::server
         ${AXLLM_VISION_LIBS}
     )
+    target_link_libraries(qwen3_tts_debug
+        -L${BSP_MSP_DIR}/lib
+        ax_engine ax_interpreter ax_sys
+        pthread tokenizer openai_api::server
+        ${AXLLM_VISION_LIBS}
+    )
     install(TARGETS axllm DESTINATION bin)
     install(TARGETS llm_smoke DESTINATION bin)
     install(TARGETS qwen3_asr_debug DESTINATION bin)
+    install(TARGETS qwen3_tts_debug DESTINATION bin)
 endif()
 
 # ---------------------------------------------------------------------------
