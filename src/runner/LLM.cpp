@@ -102,6 +102,10 @@ struct LLM::Impl {
     int cp_prefill_token_num = 64;
     int cp_kv_cache_num = 64;
 
+    // CP KV cache state: persists within a frame, reset at frame start
+    std::vector<std::vector<unsigned short>> cp_k_cache;
+    std::vector<std::vector<unsigned short>> cp_v_cache;
+
     // ---- small helpers ----
     static int post_process(LLMPostprocess &postprocess, unsigned short *p, int n, std::vector<int> &history, float *val = 0)
     {

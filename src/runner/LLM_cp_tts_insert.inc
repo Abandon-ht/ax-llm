@@ -141,6 +141,8 @@
         for (auto &m : cp_lm_heads) m.deinit();
         cp_lm_heads.clear();
         cp_embed_tables.clear();
+        cp_k_cache.clear();
+        cp_v_cache.clear();
         cp_loaded = false;
     }
 
@@ -165,11 +167,16 @@
     {
         if (!cp_loaded) return false;
         const int D = _attr.tokens_embed_size; // 1024
-        // ALOGI("RunCpFrame start primary=%d D=%d", primary_code, D);
+
+        // Reset CP KV cache at the start of each frame (new primary token from talker)
+        cp_k_cache.clear();
+        cp_v_cache.clear();
+        cp_k_cache.resize(5);
+        cp_v_cache.resize(5);
+
         // 1. primary embed via talker codec embedding table (first 3072 entries)
         std::vector<unsigned short> primary_embed(D);
         embed_selector.getByIndex((unsigned int)primary_code, primary_embed.data());
-        // ALOGI("RunCpFrame primary_embed ok");
 
         out_frame_codes.resize(16);
         out_frame_codes[0] = primary_code;
@@ -180,21 +187,19 @@
         cp_ctx.reserve(17 * D);
         cp_ctx.insert(cp_ctx.end(), last_hidden_bf16.begin(), last_hidden_bf16.end());
         cp_ctx.insert(cp_ctx.end(), primary_embed.begin(), primary_embed.end());
-        // ALOGI("RunCpFrame cp_ctx size=%zu", cp_ctx.size());
 
         std::vector<unsigned short> mask_tmp((size_t)cp_prefill_token_num * (cp_kv_cache_num + cp_prefill_token_num));
         std::vector<unsigned int> idx_tmp((size_t)cp_prefill_token_num, 0);
         std::vector<unsigned short> embed_tmp((size_t)cp_prefill_token_num * D, 0);
         std::vector<unsigned short> layer_out((size_t)cp_prefill_token_num * D, 0);
-        // ALOGI("RunCpFrame buffers allocated");
 
         for (int j = 0; j < 15; ++j)
         {
-            // ALOGI("RunCpFrame step j=%d", j);
-            int seq_len = (int)(cp_ctx.size() / D);
-            if (seq_len > cp_prefill_token_num)
+            int seq_len = (j == 0) ? 2 : 1;
+            int history_len = (j == 0) ? 0 : (j + 1);
+            if (history_len + seq_len > cp_prefill_token_num)
             {
-                ALOGE("CP seq_len(%d) > cp_prefill_token_num(%d)", seq_len, cp_prefill_token_num);
+                ALOGE("CP history_len+seq_len(%d) > cp_prefill_token_num(%d)", history_len + seq_len, cp_prefill_token_num);
                 return false;
             }
 
@@ -203,18 +208,23 @@
             std::fill(embed_tmp.begin(), embed_tmp.end(), (unsigned short)0);
             std::fill(idx_tmp.begin(), idx_tmp.end(), 0U);
 
-            // build mask (history_len=0 because we reset KV each step)
-            build_prefill_mask(mask_tmp, cp_kv_cache_num, cp_prefill_token_num, 0, seq_len);
+            // build mask with proper history_len for KV-cache attention
+            build_prefill_mask(mask_tmp, cp_kv_cache_num, cp_prefill_token_num, history_len, seq_len);
+
             // indices
-            for (int i = 0; i < seq_len; ++i) idx_tmp[i] = (unsigned int)i;
+            for (int i = 0; i < seq_len; ++i) idx_tmp[i] = (unsigned int)(history_len + i);
+
             // embed
-            memcpy(embed_tmp.data(), cp_ctx.data(), seq_len * D * sizeof(unsigned short));
-            // ALOGI("RunCpFrame prepared inputs seq_len=%d", seq_len);
+            if (j == 0) {
+                memcpy(embed_tmp.data(), cp_ctx.data(), seq_len * D * sizeof(unsigned short));
+            } else {
+                // only the latest residual embedding is the new input
+                memcpy(embed_tmp.data(), cp_ctx.data() + (cp_ctx.size() - D), D * sizeof(unsigned short));
+            }
 
             // run CP 5 layers
             for (int m = 0; m < 5; ++m)
             {
-                // ALOGI("RunCpFrame layer m=%d", m);
                 auto &lyr = cp_layers[m];
                 int devid = LLM_DEVID(lyr);
                 int gid = cp_prefill_gid;
@@ -227,21 +237,53 @@
                 auto &t_idx = lyr.layer.get_input(gid, "indices");
                 size_t idx_copy = std::min((size_t)t_idx.nSize, idx_tmp.size() * sizeof(unsigned int));
                 llm_h2d(LLM_WADDR(t_idx), idx_tmp.data(), idx_copy, devid);
-                // K/V cache: zero them because we do full re-run each step
+
+                // K/V cache: zero on first step (frame start), reuse previous output otherwise
                 try {
                     auto &tk = lyr.layer.get_input(gid, "K_cache");
-                    if (tk.pVirAddr) llm_memset(LLM_WADDR(tk), 0, tk.nSize, devid);
+                    if (tk.pVirAddr) {
+                        if (j == 0) {
+                            llm_memset(LLM_WADDR(tk), 0, tk.nSize, devid);
+                        } else if (!cp_k_cache[m].empty()) {
+                            llm_h2d(LLM_WADDR(tk), cp_k_cache[m].data(), std::min((size_t)tk.nSize, cp_k_cache[m].size() * sizeof(unsigned short)), devid);
+                        } else {
+                            llm_memset(LLM_WADDR(tk), 0, tk.nSize, devid);
+                        }
+                    }
                 } catch (...) {}
                 try {
                     auto &tv = lyr.layer.get_input(gid, "V_cache");
-                    if (tv.pVirAddr) llm_memset(LLM_WADDR(tv), 0, tv.nSize, devid);
+                    if (tv.pVirAddr) {
+                        if (j == 0) {
+                            llm_memset(LLM_WADDR(tv), 0, tv.nSize, devid);
+                        } else if (!cp_v_cache[m].empty()) {
+                            llm_h2d(LLM_WADDR(tv), cp_v_cache[m].data(), std::min((size_t)tv.nSize, cp_v_cache[m].size() * sizeof(unsigned short)), devid);
+                        } else {
+                            llm_memset(LLM_WADDR(tv), 0, tv.nSize, devid);
+                        }
+                    }
                 } catch (...) {}
+
                 int inf_ret = lyr.layer.inference(gid);
                 if (inf_ret != 0) ALOGE("RunCpFrame layer m=%d inference failed ret=%d", m, inf_ret);
+
                 auto &t_out = lyr.layer.get_output(gid, "output");
                 llm_d2h(layer_out.data(), LLM_RADDR(t_out), std::min((size_t)t_out.nSize, layer_out.size() * sizeof(unsigned short)), devid);
-                // prepare input for next layer
                 memcpy(embed_tmp.data(), layer_out.data(), seq_len * D * sizeof(unsigned short));
+
+                // Save K/V cache output for next step within this frame
+                try {
+                    auto &tk_out = lyr.layer.get_output(gid, "K_cache_out");
+                    size_t kv_words = tk_out.nSize / sizeof(unsigned short);
+                    if (cp_k_cache[m].size() < kv_words) cp_k_cache[m].resize(kv_words);
+                    llm_d2h(cp_k_cache[m].data(), LLM_RADDR(tk_out), tk_out.nSize, devid);
+                } catch (...) {}
+                try {
+                    auto &tv_out = lyr.layer.get_output(gid, "V_cache_out");
+                    size_t kv_words = tv_out.nSize / sizeof(unsigned short);
+                    if (cp_v_cache[m].size() < kv_words) cp_v_cache[m].resize(kv_words);
+                    llm_d2h(cp_v_cache[m].data(), LLM_RADDR(tv_out), tv_out.nSize, devid);
+                } catch (...) {}
             }
 
             // take last position hidden state
@@ -285,8 +327,6 @@
                 for (int i = 0; i < logits_n; ++i) {
                     if (logits_fp32[i] > max_logit) { max_logit = logits_fp32[i]; max_idx = i; }
                 }
-                // ALOGI("RunCpFrame lm_head j=%d logits_n=%d max_logit=%f max_idx=%d",
-                //       j, logits_n, max_logit, max_idx);
                 int res_code = postprocess.apply(logits_fp32, {});
                 out_frame_codes[j + 1] = res_code;
 
