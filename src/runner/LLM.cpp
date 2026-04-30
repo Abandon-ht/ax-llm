@@ -92,6 +92,16 @@ struct LLM::Impl {
     std::atomic<bool> b_stop{false};
     LLMPostprocess postprocess;
 
+    // ---- Qwen3-TTS Code Predictor ----
+    std::vector<LLMLayer> cp_layers;
+    ax_runner_t cp_post;
+    std::vector<ax_runner_t> cp_lm_heads;
+    std::vector<std::vector<unsigned short>> cp_embed_tables;
+    bool cp_loaded = false;
+    int cp_prefill_gid = 1;
+    int cp_prefill_token_num = 64;
+    int cp_kv_cache_num = 64;
+
     // ---- small helpers ----
     static int post_process(LLMPostprocess &postprocess, unsigned short *p, int n, std::vector<int> &history, float *val = 0)
     {
@@ -741,12 +751,26 @@ struct LLM::Impl {
                 ALOGW("load postprocess config(%s) failed", this->_attr.post_config_path.c_str());
             }
         }
+        // ---- Init Code Predictor (optional) ----
+        if (!_attr.cp_model_dir.empty())
+        {
+            if (!InitCp(_attr.cp_model_dir))
+            {
+                ALOGW("InitCp(%s) failed, TTS decode will not work", _attr.cp_model_dir.c_str());
+            }
+            else
+            {
+                ALOGI("Code Predictor init ok");
+            }
+        }
+
         ALOGI("LLM init ok");
         return true;
     }
 
     void Deinit()
     {
+        DeinitCp();
         for (int i = 0; i < _attr.axmodel_num; i++) llama_layers[i].layer.deinit();
         llama_post.deinit();
         embed_selector.Deinit();
@@ -1333,8 +1357,8 @@ struct LLM::Impl {
             if (_attr.runing_callback)
             {
                 printf("next_token: %d\n", next_token);
-                auto str = utf8_filter.filter(tokenizer->decode(next_token));
-                if (!str.empty()) _attr.runing_callback(str, -1, _attr.reserve);
+                // auto str = utf8_filter.filter(tokenizer->decode(next_token));
+                // if (!str.empty()) _attr.runing_callback(str, -1, _attr.reserve);
             }
         }
 
@@ -1459,8 +1483,8 @@ struct LLM::Impl {
                 float t_ms  = t_cost.cost(); float tps   = token_ids.size() / (t_ms / 1000.0f);
                 fprintf(stdout, "%d, ", next_token);
                 fflush(stdout);
-                auto  str   = utf8_filter.filter(tokenizer->decode(next_token));
-                if (!str.empty()) _attr.runing_callback(str, tps, _attr.reserve);
+                // auto  str   = utf8_filter.filter(tokenizer->decode(next_token));
+                // if (!str.empty()) _attr.runing_callback(str, tps, _attr.reserve);
             }
             if (output_max_token > 0 && (int)token_ids.size() >= output_max_token) { b_hit_eos = true; break; }
             if (_attr.runing_callback == nullptr) update_cqdm(&cqdm, indices, "token", "");
@@ -1470,8 +1494,11 @@ struct LLM::Impl {
         float t_ms = t_cost.cost();
         const float avg_tps = (t_ms > 0.0f) ? ((float)token_ids.size() / (t_ms / 1000.0f)) : 0.0f;
         ALOGN("hit eos,tokens=%zu,avg %.2f token/s\n", token_ids.size(), avg_tps);
-        final_out = tokenizer->decode(token_ids); return final_out;
+        // final_out = tokenizer->decode(token_ids); return final_out;
+        return ""; // TTS: skip text decode, return empty
     }
+
+#include "LLM_cp_tts_insert.inc"
 
     std::vector<Content> Run(std::vector<Content> history, int output_max_token = -1)
     {
@@ -1594,3 +1621,8 @@ void LLM::ResetKVCache() { impl_->ResetKVCache(); }
 std::vector<Content> LLM::Run(std::vector<Content> history, int output_max_token) { return impl_->Run(std::move(history), output_max_token); }
 std::vector<Content> LLM::Run(std::vector<Content> history, const std::vector<MediaInputs> &media_inputs, int output_max_token) { return impl_->Run(std::move(history), media_inputs, output_max_token); }
 std::string LLM::Run(std::vector<unsigned short> &embed, int output_max_token) { return impl_->Run(embed, output_max_token); }
+
+bool LLM::RunTts(std::vector<unsigned short> &prefill_embeds, int max_new_tokens, int codec_eos_token_id, TtsDecodeResult &result)
+{
+    return impl_->RunTts(prefill_embeds, max_new_tokens, codec_eos_token_id, result);
+}

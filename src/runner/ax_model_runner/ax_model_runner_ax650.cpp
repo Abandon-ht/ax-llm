@@ -220,7 +220,8 @@ int ax_runner_ax650::sub_init()
     }
 
     // 2. 处理中间 Group 的内存共享逻辑 (原有逻辑的 Hack)
-    if (io_count > 2)
+    // Fix: also handle io_count == 2 so that last group's K_cache/V_cache is shared with group 0
+    if (io_count >= 2)
     {
         auto &first_io_data = m_handle->io_data[0];
         auto &first_io_info = m_handle->io_info[0];

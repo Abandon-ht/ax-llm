@@ -375,10 +375,23 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // 设置 callback（打印解码过程中的 token）
-    attr.runing_callback = [](std::string str, float /*tps*/, void * /*r*/) {
-        fprintf(stdout, "%s", str.c_str());
-        fflush(stdout);
+    // 推断 code-predictor 目录
+    std::filesystem::path model_path(model_dir);
+    std::string cp_model_dir = (model_path / ".." / "code-predictor").lexically_normal().string();
+    if (std::filesystem::exists(cp_model_dir))
+    {
+        attr.cp_model_dir = cp_model_dir;
+        printf("[INFO] CP model dir: %s\n", cp_model_dir.c_str());
+    }
+    else
+    {
+        ALOGW("CP model dir not found: %s", cp_model_dir.c_str());
+    }
+
+    // 设置 callback：TTS token 不是文本，decode 出来是乱码，因此不打印字符串。
+    // 保留非空 callback 使 LLM.cpp 内部的 token id 打印逻辑继续执行。
+    attr.runing_callback = [](std::string /*str*/, float /*tps*/, void * /*r*/) {
+        // 不输出乱码字符串，token id 已由 LLM.cpp 内部打印
     };
 
     LLM llm;
@@ -399,16 +412,53 @@ int main(int argc, char **argv)
     //   - 循环 decode，每步调用 decode 组（单 token）
     //   - 遇到 EOS 停止，返回 tokenizer.decode(generated_ids)
 
-    printf("[INFO] Running ASR decode (S=%d tokens, max_new_tokens=%d)...\n\n",
+    printf("[INFO] Running TTS decode (S=%d tokens, max_new_tokens=%d)...\n\n",
            S, max_new_tokens);
 
+    LLM::TtsDecodeResult tts_result;
+    const int codec_eos_token_id = 2150;
     const auto t0 = std::chrono::steady_clock::now();
-    std::string result = llm.Run(combined_embed, max_new_tokens);
+    bool ok = llm.RunTts(combined_embed, max_new_tokens, codec_eos_token_id, tts_result);
     const auto t1 = std::chrono::steady_clock::now();
 
     const double elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    printf("\n\n[RESULT] %s\n", result.c_str());
     printf("[TIME]   %.2f ms\n", elapsed_ms);
+    printf("[RESULT] frames=%zu\n", tts_result.frames.size());
+
+    if (ok && !tts_result.frames.empty())
+    {
+        // Save output_codes.bin
+        std::string out_bin = npy_dir.back() == '/' ? npy_dir + "output_codes.bin" : npy_dir + "/output_codes.bin";
+        FILE *fp = fopen(out_bin.c_str(), "wb");
+        if (fp)
+        {
+            for (const auto &f : tts_result.frames)
+            {
+                int32_t buf[16];
+                for (int i = 0; i < 16; ++i) buf[i] = f.codes[i];
+                fwrite(buf, sizeof(int32_t), 16, fp);
+            }
+            fclose(fp);
+            printf("[SAVE]   %s  (%zu frames)\n", out_bin.c_str(), tts_result.frames.size());
+        }
+        // Save meta.json
+        std::string out_meta = npy_dir.back() == '/' ? npy_dir + "output_meta.json" : npy_dir + "/output_meta.json";
+        {
+            nlohmann::json j;
+            j["num_frames"] = (int)tts_result.frames.size();
+            j["num_codebooks"] = 16;
+            j["dtype"] = "int32";
+            j["shape"] = { (int)tts_result.frames.size(), 16 };
+            j["codec_eos_token_id"] = codec_eos_token_id;
+            std::ofstream ofs(out_meta);
+            ofs << j.dump(2);
+            printf("[SAVE]   %s\n", out_meta.c_str());
+        }
+    }
+    else
+    {
+        ALOGE("RunTts failed or no frames generated");
+    }
 
     // ── 5. 可选：从 input_ids.npy 验证 ────────────────────────────────────
     const std::string ids_path = npy_dir + "/input_ids.npy";

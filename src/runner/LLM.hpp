@@ -52,6 +52,9 @@ struct LLMAttrType {
     std::string post_config_path = "post_config.json";
     bool b_use_mmap_load_embed = false;
 
+    // Qwen3-TTS code-predictor directory (optional)
+    std::string cp_model_dir;
+
     // ---- vision / VLM (optional, runtime switch by `vlm_type`) ----
     // If `vlm_type != VLMType::None`, vision encoder will be initialized and used.
     // See `VLMType` in `src/runner/VLMType.hpp`.
@@ -120,6 +123,16 @@ public:
     std::vector<Content> Run(std::vector<Content> history, int output_max_token = -1);
     std::vector<Content> Run(std::vector<Content> history, const std::vector<MediaInputs> &media_inputs, int output_max_token = -1);
     std::string Run(std::vector<unsigned short> &embed, int output_max_token = -1);
+
+    // Qwen3-TTS decode: returns true on success, fills result.
+    struct TtsFrame { int codes[16]; };
+    struct TtsDecodeResult {
+        std::vector<TtsFrame> frames;
+    };
+    bool RunTts(std::vector<unsigned short> &prefill_embeds,
+                int max_new_tokens,
+                int codec_eos_token_id,
+                TtsDecodeResult &result);
 
 private:
     struct Impl;
