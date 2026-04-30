@@ -173,10 +173,24 @@ if(BUILD_AX650)
         ${COMMON_SOURCES}
         src/runner/ax_model_runner/ax_model_runner_ax650.cpp
     )
+    add_executable(qwen3_tts_ablation tools/qwen3_tts_ablation.cpp
+        ${COMMON_SOURCES}
+        src/runner/ax_model_runner/ax_model_runner_ax650.cpp
+    )
     target_include_directories(axllm PRIVATE ${BSP_MSP_DIR}/include)
     target_include_directories(llm_smoke PRIVATE ${BSP_MSP_DIR}/include)
     target_include_directories(qwen3_asr_debug PRIVATE ${BSP_MSP_DIR}/include)
     target_include_directories(qwen3_tts_debug PRIVATE ${BSP_MSP_DIR}/include)
+    target_include_directories(qwen3_tts_ablation PRIVATE ${BSP_MSP_DIR}/include)
+    # ONNX Runtime headers for ablation tool
+    set(ONNXRUNTIME_INCLUDE_DIR /home/m5stack/Workspace/kaldi/sherpa-onnx/build-axcl-linux-aarch64_m5stack_release/_deps/onnxruntime-src/include)
+    set(ONNXRUNTIME_LIB_DIR /home/m5stack/Workspace/kaldi/sherpa-onnx/build-axcl-linux-aarch64_m5stack_release/_deps/onnxruntime-src/lib)
+    if(EXISTS ${ONNXRUNTIME_INCLUDE_DIR}/onnxruntime_cxx_api.h)
+        target_include_directories(qwen3_tts_ablation PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
+        message(STATUS "ONNX Runtime found for qwen3_tts_ablation: ${ONNXRUNTIME_INCLUDE_DIR}")
+    else()
+        message(FATAL_ERROR "ONNX Runtime headers not found at ${ONNXRUNTIME_INCLUDE_DIR}")
+    endif()
     # link_directories 是全局的，用 target 属性更干净；CMake < 3.13 没有
     # target_link_directories，改用 set_target_properties 设置 LINK_FLAGS 或
     # 直接传绝对路径库目录给 target_link_libraries 的 -L 形式：
@@ -204,10 +218,19 @@ if(BUILD_AX650)
         pthread tokenizer openai_api::server
         ${AXLLM_VISION_LIBS}
     )
+    target_link_libraries(qwen3_tts_ablation
+        -L${BSP_MSP_DIR}/lib
+        -L${ONNXRUNTIME_LIB_DIR}
+        ax_engine ax_interpreter ax_sys
+        onnxruntime
+        pthread tokenizer openai_api::server
+        ${AXLLM_VISION_LIBS}
+    )
     install(TARGETS axllm DESTINATION bin)
     install(TARGETS llm_smoke DESTINATION bin)
     install(TARGETS qwen3_asr_debug DESTINATION bin)
     install(TARGETS qwen3_tts_debug DESTINATION bin)
+    install(TARGETS qwen3_tts_ablation DESTINATION bin)
 endif()
 
 # ---------------------------------------------------------------------------

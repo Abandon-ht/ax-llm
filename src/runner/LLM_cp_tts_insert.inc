@@ -358,6 +358,15 @@
                 int codec_eos_token_id,
                 TtsDecodeResult &result)
     {
+        return RunTtsWithCpCallback(prefill_embeds, max_new_tokens, codec_eos_token_id, result, nullptr);
+    }
+
+    bool RunTtsWithCpCallback(std::vector<unsigned short> &prefill_embeds,
+                              int max_new_tokens,
+                              int codec_eos_token_id,
+                              TtsDecodeResult &result,
+                              LLM::TtsCpCallback *cp_callback)
+    {
         if (!cp_loaded) { ALOGE("CP not loaded, cannot RunTts"); return false; }
         b_stop.store(false, std::memory_order_relaxed);
         bfloat16 bf16 = -65536.f;
@@ -507,7 +516,13 @@
             std::vector<int> frame_codes;
             std::vector<unsigned short> codec_sum_bf16;
             std::vector<unsigned short> last_hidden_bf16 = embed; // [D]
-            if (!RunCpFrame(last_hidden_bf16, primary_code, frame_codes, codec_sum_bf16))
+            bool cp_ok = false;
+            if (cp_callback) {
+                cp_ok = cp_callback->OnCpFrame(last_hidden_bf16, primary_code, frame_codes, codec_sum_bf16);
+            } else {
+                cp_ok = RunCpFrame(last_hidden_bf16, primary_code, frame_codes, codec_sum_bf16);
+            }
+            if (!cp_ok)
             {
                 ALOGE("RunCpFrame failed at step %d", step);
                 break;

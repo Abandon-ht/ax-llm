@@ -134,6 +134,26 @@ public:
                 int codec_eos_token_id,
                 TtsDecodeResult &result);
 
+    // Standalone CP frame inference (for ablation experiments).
+    // Requires cp_model_dir to be set during Init.
+    bool RunCpFrame(const std::vector<unsigned short> &last_hidden_bf16,
+                    int primary_code,
+                    std::vector<int> &out_frame_codes,
+                    std::vector<unsigned short> &out_codec_sum_bf16);
+
+    // CP callback interface for hybrid ablation (e.g. AX Talker + ONNX CP).
+    struct TtsCpCallback {
+        virtual bool OnCpFrame(const std::vector<unsigned short> &last_hidden_bf16,
+                               int primary_code,
+                               std::vector<int> &out_frame_codes,
+                               std::vector<unsigned short> &out_codec_sum_bf16) = 0;
+    };
+    bool RunTtsWithCpCallback(std::vector<unsigned short> &prefill_embeds,
+                              int max_new_tokens,
+                              int codec_eos_token_id,
+                              TtsDecodeResult &result,
+                              TtsCpCallback *cp_callback);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

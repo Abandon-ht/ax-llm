@@ -1630,3 +1630,20 @@ bool LLM::RunTts(std::vector<unsigned short> &prefill_embeds, int max_new_tokens
 {
     return impl_->RunTts(prefill_embeds, max_new_tokens, codec_eos_token_id, result);
 }
+
+bool LLM::RunCpFrame(const std::vector<unsigned short> &last_hidden_bf16,
+                     int primary_code,
+                     std::vector<int> &out_frame_codes,
+                     std::vector<unsigned short> &out_codec_sum_bf16)
+{
+    return impl_->RunCpFrame(last_hidden_bf16, primary_code, out_frame_codes, out_codec_sum_bf16);
+}
+
+bool LLM::RunTtsWithCpCallback(std::vector<unsigned short> &prefill_embeds,
+                               int max_new_tokens,
+                               int codec_eos_token_id,
+                               TtsDecodeResult &result,
+                               TtsCpCallback *cp_callback)
+{
+    return impl_->RunTtsWithCpCallback(prefill_embeds, max_new_tokens, codec_eos_token_id, result, cp_callback);
+}
