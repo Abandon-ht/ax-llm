@@ -25,6 +25,7 @@
 #include <memory>
 #include <algorithm>
 #include <numeric>
+#include <random>
 
 #include "runner/LLM.hpp"
 #include "runner/utils/sample_log.h"
@@ -232,6 +233,81 @@ private:
     }
 };
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Sampling helper (参考 sherpa-onnx SampleFromLogits)
+// ═══════════════════════════════════════════════════════════════════════════
+
+static int SampleFromLogits(const float *logits_data, int32_t total, int32_t vocab_size,
+                            float temperature, int32_t top_k, float top_p,
+                            float repetition_penalty,
+                            const std::vector<int> &generated_ids,
+                            int32_t suppress_start, int32_t suppress_end,
+                            int suppress_exception, bool suppress_eos)
+{
+    const int32_t V = total >= vocab_size ? vocab_size : total;
+    const float *src = logits_data + (total - V);
+    std::vector<float> buf(src, src + V);
+
+    if (suppress_start >= 0 && suppress_end > suppress_start)
+        for (int32_t i = suppress_start; i < std::min(suppress_end, V); ++i)
+            if (i != suppress_exception) buf[i] = -1e9f;
+
+    if (suppress_eos && suppress_exception >= 0 && suppress_exception < V)
+        buf[suppress_exception] = -1e9f;
+
+    if (repetition_penalty > 1.0f)
+        for (auto id : generated_ids)
+            if (id >= 0 && id < V)
+                buf[id] = buf[id] > 0 ? buf[id] / repetition_penalty
+                                      : buf[id] * repetition_penalty;
+
+    if (temperature < 1e-6f)
+        return static_cast<int>(std::max_element(buf.begin(), buf.end()) - buf.begin());
+
+    for (auto &v : buf) v /= temperature;
+
+    if (top_k > 0 && top_k < V) {
+        std::vector<float> tmp(buf.begin(), buf.end());
+        std::partial_sort(tmp.begin(), tmp.begin() + top_k, tmp.end(), std::greater<float>());
+        const float thr = tmp[top_k - 1];
+        for (auto &v : buf)
+            if (v < thr) v = -1e9f;
+    }
+
+    const float max_v = *std::max_element(buf.begin(), buf.end());
+    float sum = 0;
+    for (auto &v : buf) {
+        v = std::exp(v - max_v);
+        sum += v;
+    }
+    for (auto &v : buf) v /= sum;
+
+    if (top_p < 1.0f && top_p > 0.0f) {
+        std::vector<std::pair<float, int32_t>> pi(V);
+        for (int32_t i = 0; i < V; ++i) pi[i] = {buf[i], i};
+        std::sort(pi.begin(), pi.end(),
+                  [](const auto &a, const auto &b) { return a.first > b.first; });
+        float cum = 0;
+        int32_t cut = V;
+        for (int32_t i = 0; i < V; ++i) {
+            cum += pi[i].first;
+            if (cum >= top_p) {
+                cut = i + 1;
+                break;
+            }
+        }
+        for (int32_t i = cut; i < V; ++i) buf[pi[i].second] = 0.0f;
+        float ns = 0;
+        for (auto v : buf) ns += v;
+        if (ns > 0)
+            for (auto &v : buf) v /= ns;
+    }
+
+    thread_local std::mt19937 rng(std::random_device{}());
+    return static_cast<int>(
+        std::discrete_distribution<int32_t>(buf.begin(), buf.end())(rng));
+}
+
 // ── ONNX Code Predictor ────────────────────────────────────────────────────
 class OnnxCp {
 public:
@@ -252,7 +328,8 @@ public:
         codec_embed_sess_ = std::make_unique<Ort::Session>(env_, codec_embed_path.c_str(), opts);
     }
 
-    Result RunFrame(const float *last_hidden_fp32, int primary_code, int hidden_size)
+    Result RunFrame(const float *last_hidden_fp32, int primary_code, int hidden_size,
+                    float temperature, int top_k, float top_p, int vocab_size)
     {
         const int D = hidden_size;
         Result res;
@@ -286,8 +363,12 @@ public:
 
             auto cp_logits = RunCpSession(std::move(cp_emb), std::move(gen_step));
             const float *logits_data = cp_logits.GetTensorData<float>();
-            int vocab_size = static_cast<int>(cp_logits.GetTensorTypeAndShapeInfo().GetShape()[1]);
-            int res_code = static_cast<int>(std::max_element(logits_data, logits_data + vocab_size) - logits_data);
+            int logits_total = static_cast<int>(cp_logits.GetTensorTypeAndShapeInfo().GetShape()[1]);
+            int res_code = SampleFromLogits(
+                logits_data, logits_total, vocab_size,
+                temperature, top_k, top_p, /*repetition_penalty=*/1.0f,
+                /*generated_ids=*/{}, /*suppress_start=*/-1, /*suppress_end=*/-1,
+                /*suppress_exception=*/-1, /*suppress_eos=*/false);
             res.frame_codes[j + 1] = res_code;
 
             // residual embed via code_predictor_embed.onnx
@@ -404,20 +485,20 @@ int main(int argc, char **argv)
     const int audio_token_id = meta.value("audio_token_id", 151644);
     printf("S=%d hidden_size=%d\n", S, hidden_size);
 
-    // ── 1. 读取 prefill_embeds.bin ──────────────────────────────────────────
+    // ── 1. 读取 prefill_embeds.bin (float32) ────────────────────────────────
     const std::string embed_path = npy_dir + "/prefill_embeds.bin";
     std::vector<uint8_t> embed_raw;
     if (!read_binary_file(embed_path, embed_raw)) return 1;
-    const size_t expected_bytes = (size_t)S * hidden_size * sizeof(uint16_t);
+    const size_t expected_bytes = (size_t)S * hidden_size * sizeof(float);
     if (embed_raw.size() != expected_bytes) { ALOGE("embed size mismatch"); return 1; }
-    std::vector<unsigned short> prefill_embeds_bf16(
-        reinterpret_cast<uint16_t *>(embed_raw.data()),
-        reinterpret_cast<uint16_t *>(embed_raw.data()) + (size_t)S * hidden_size
+    std::vector<float> prefill_embeds_fp32(
+        reinterpret_cast<float *>(embed_raw.data()),
+        reinterpret_cast<float *>(embed_raw.data()) + (size_t)S * hidden_size
     );
 
-    // fp32 copy for ONNX talker
-    std::vector<float> prefill_embeds_fp32((size_t)S * hidden_size);
-    bf16_vec_to_fp32(prefill_embeds_bf16.data(), prefill_embeds_fp32.data(), (int)prefill_embeds_bf16.size());
+    // bf16 copy for AXModel talker
+    std::vector<unsigned short> prefill_embeds_bf16((size_t)S * hidden_size);
+    fp32_vec_to_bf16(prefill_embeds_fp32.data(), prefill_embeds_bf16.data(), (int)prefill_embeds_fp32.size());
 
     // ── 2. 初始化 AX650 系统 ────────────────────────────────────────────────
 #ifndef USE_AXCL
@@ -460,6 +541,10 @@ int main(int argc, char **argv)
     struct OnnxCpCallback : public LLM::TtsCpCallback {
         OnnxCp *cp = nullptr;
         int hidden_size = 1024;
+        float temperature = 0.9f;
+        int top_k = 50;
+        float top_p = 1.0f;
+        int vocab_size = 2048;
         bool OnCpFrame(const std::vector<unsigned short> &last_hidden_bf16,
                        int primary_code,
                        std::vector<int> &out_frame_codes,
@@ -468,21 +553,38 @@ int main(int argc, char **argv)
             if (!cp) return false;
             std::vector<float> last_hidden_fp32(hidden_size);
             bf16_vec_to_fp32(last_hidden_bf16.data(), last_hidden_fp32.data(), hidden_size);
-            auto res = cp->RunFrame(last_hidden_fp32.data(), primary_code, hidden_size);
+            auto res = cp->RunFrame(last_hidden_fp32.data(), primary_code, hidden_size,
+                                    temperature, top_k, top_p, vocab_size);
             out_frame_codes = res.frame_codes;
             out_codec_sum_bf16.resize(hidden_size);
             fp32_vec_to_bf16(res.codec_sum_fp32.data(), out_codec_sum_bf16.data(), hidden_size);
             return true;
         }
     };
+    const int codec_eos_token_id = 2150;
+    const int talker_vocab_size = 3072;
+    const int code_predictor_vocab_size = 2048;
+    const float temperature = 0.9f;
+    const int top_k = 50;
+    const float top_p = 1.0f;
+    const float repetition_penalty = 1.05f;
+    const float sub_temperature = 0.9f;
+    const int sub_top_k = 50;
+    const float sub_top_p = 1.0f;
+    const int suppress_start = talker_vocab_size - 1024;
+    const int suppress_end = talker_vocab_size;
+    constexpr int kMinNewTokens = 2;
+
     OnnxCpCallback onnx_cp_callback;
     if (mode == AblationMode::AX_ONNX) {
         onnx_cp_callback.cp = onnx_cp.get();
         onnx_cp_callback.hidden_size = hidden_size;
+        onnx_cp_callback.temperature = sub_temperature;
+        onnx_cp_callback.top_k = sub_top_k;
+        onnx_cp_callback.top_p = sub_top_p;
+        onnx_cp_callback.vocab_size = code_predictor_vocab_size;
     }
 
-    const int codec_eos_token_id = 2150;
-    const int trailing_start = 7; // text[0] position in 85-token prefill layout
     LLM::TtsDecodeResult tts_result;
     const auto t0 = std::chrono::steady_clock::now();
 
@@ -494,42 +596,44 @@ int main(int argc, char **argv)
         if (!ok) { ALOGE("RunTts failed"); }
     }
     // ═══════════════════════════════════════════════════════════════════════
-    // Mode 1/2/3: 需要手动 loop
+    // Mode 2: AX Talker + ONNX CP  → 通过 callback 使用 ONNX CP
+    // ═══════════════════════════════════════════════════════════════════════
+    else if (mode == AblationMode::AX_ONNX) {
+        bool ok = llm.RunTtsWithCpCallback(prefill_embeds_bf16, max_new_tokens, codec_eos_token_id, tts_result, &onnx_cp_callback);
+        if (!ok) { ALOGE("RunTtsWithCpCallback failed"); }
+    }
+    // ═══════════════════════════════════════════════════════════════════════
+    // Mode 1/3: ONNX Talker + (AX CP or ONNX CP)  → 手动 loop
     // ═══════════════════════════════════════════════════════════════════════
     else {
-        // For mixed modes we need to run the loop manually.
-        // Save prefill hidden states from AX talker prefill (needed for txt_hidden in all modes).
-        // We'll run a single-step prefill using AXModel to get all_prefill_hidden and first token.
-        // Actually for Mode 1/3 (ONNX Talker) we don't need AX prefill, but we still need
-        // all_prefill_hidden for trailing text. For simplicity, always prefill with AXModel
-        // when mode!=0? No, for Mode 1/3 ONNX Talker does its own prefill.
-        // But we still need the trailing text hidden states. These are positions 7..84 of prefill_embeds.
-        // We can extract them directly from prefill_embeds_bf16!
-        // So no need to run AXModel prefill for Mode 1/3.
-
-        std::vector<unsigned short> all_prefill_hidden;
-        std::vector<float> all_prefill_hidden_fp32;
-        int first_primary_code = -1;
-
-        if (mode == AblationMode::AX_ONNX) {
-            // Use AXModel Talker + ONNX CP via callback
-            bool ok = llm.RunTtsWithCpCallback(prefill_embeds_bf16, max_new_tokens, codec_eos_token_id, tts_result, &onnx_cp_callback);
-            if (!ok) { ALOGE("RunTtsWithCpCallback failed"); }
+        // ── 读取 tts_pad_vec.bin (与 qwen3_tts_onnx.cpp 对齐) ────────────────
+        const std::string pad_vec_path = npy_dir.back() == '/' ? npy_dir + "tts_pad_vec.bin"
+                                                               : npy_dir + "/tts_pad_vec.bin";
+        std::vector<uint8_t> pad_raw;
+        if (!read_binary_file(pad_vec_path, pad_raw)) return 1;
+        if (pad_raw.size() < sizeof(int32_t)) { ALOGE("tts_pad_vec too small"); return 1; }
+        int32_t pad_hidden = *reinterpret_cast<int32_t *>(pad_raw.data());
+        if (pad_hidden != hidden_size) {
+            ALOGE("tts_pad_vec hidden_size mismatch: file=%d, expected=%d", pad_hidden, hidden_size);
+            return 1;
         }
-
-        // Mode 1 (ONNX Talker + AX CP) and Mode 3 (ONNX Talker + ONNX CP)
-        // Extract trailing text hidden states from prefill_embeds directly
-        // Positions 7..84 are the trailing text embeddings.
-        all_prefill_hidden_fp32.resize((size_t)S * hidden_size);
-        for (size_t i = 0; i < prefill_embeds_bf16.size(); ++i) {
-            unsigned int u = ((unsigned int)prefill_embeds_bf16[i]) << 16;
-            all_prefill_hidden_fp32[i] = *reinterpret_cast<float *>(&u);
+        const size_t pad_expected = sizeof(int32_t) + (size_t)hidden_size * sizeof(float);
+        if (pad_raw.size() != pad_expected) {
+            ALOGE("tts_pad_vec size mismatch: %zu vs expected %zu", pad_raw.size(), pad_expected);
+            return 1;
         }
+        std::vector<float> tts_pad_vec(
+            reinterpret_cast<float *>(pad_raw.data() + sizeof(int32_t)),
+            reinterpret_cast<float *>(pad_raw.data() + sizeof(int32_t)) + hidden_size
+        );
 
         // ONNX Talker prefill
         auto pr = onnx_talker->Prefill(prefill_embeds_fp32.data(), S, hidden_size);
-        // Sample first primary code (greedy)
-        first_primary_code = static_cast<int>(std::max_element(pr.logits.begin(), pr.logits.end()) - pr.logits.begin());
+        int first_primary_code = SampleFromLogits(
+            pr.logits.data(), static_cast<int32_t>(pr.logits.size()), talker_vocab_size,
+            temperature, top_k, top_p, repetition_penalty,
+            /*generated_ids=*/{}, suppress_start, suppress_end, codec_eos_token_id,
+            /*suppress_eos=*/true);
         printf("first_primary_code=%d\n", first_primary_code);
 
         if (first_primary_code == codec_eos_token_id) {
@@ -563,30 +667,32 @@ int main(int argc, char **argv)
                     codec_sum_fp32.resize(hidden_size);
                     bf16_vec_to_fp32(codec_sum_bf16.data(), codec_sum_fp32.data(), hidden_size);
                 } else { // ONNX_ONNX
-                    auto cp_res = onnx_cp->RunFrame(last_hidden_fp32.data(), primary_code, hidden_size);
+                    auto cp_res = onnx_cp->RunFrame(last_hidden_fp32.data(), primary_code, hidden_size,
+                                                    sub_temperature, sub_top_k, sub_top_p,
+                                                    code_predictor_vocab_size);
                     frame_codes = cp_res.frame_codes;
                     codec_sum_fp32 = cp_res.codec_sum_fp32;
                 }
 
-                printf("frame=%d primary=%d", step, primary_code);
-                for (int j = 0; j < 15; ++j) printf(" res_%d=%d", j, frame_codes[j + 1]);
+                printf("frame=%d %d", step, primary_code);
+                for (int j = 0; j < 15; ++j) printf(" %d", frame_codes[j + 1]);
                 printf("\n"); fflush(stdout);
 
-                // Build next talker input = codec_sum + txt_hidden[step]
+                // Build next talker input = codec_sum + tts_pad_vec
+                // (与 qwen3_tts_onnx.cpp non-streaming 模式一致)
                 std::vector<float> next_in_fp32(hidden_size);
-                int txt_pos = trailing_start + step;
-                if (txt_pos < S) {
-                    for (int d = 0; d < hidden_size; ++d) {
-                        next_in_fp32[d] = codec_sum_fp32[d] + all_prefill_hidden_fp32[(size_t)txt_pos * hidden_size + d];
-                    }
-                } else {
-                    next_in_fp32 = codec_sum_fp32;
+                for (int d = 0; d < hidden_size; ++d) {
+                    next_in_fp32[d] = codec_sum_fp32[d] + tts_pad_vec[d];
                 }
 
                 // ONNX Talker decode
                 total_seq_len++;
                 auto dr = onnx_talker->Decode(next_in_fp32.data(), total_seq_len, hidden_size, talker_state);
-                next_token = static_cast<int>(std::max_element(dr.logits.begin(), dr.logits.end()) - dr.logits.begin());
+                next_token = SampleFromLogits(
+                    dr.logits.data(), static_cast<int32_t>(dr.logits.size()), talker_vocab_size,
+                    temperature, top_k, top_p, repetition_penalty,
+                    generated_primary, suppress_start, suppress_end, codec_eos_token_id,
+                    /*suppress_eos=*/(step + 1) < kMinNewTokens);
                 last_hidden_fp32 = dr.last_hidden;
                 talker_state = std::move(dr.state);
                 generated_primary.push_back(next_token);

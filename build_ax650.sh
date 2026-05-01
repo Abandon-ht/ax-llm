@@ -32,30 +32,30 @@ if [ ! -f "${BSP_MSP_DIR}/lib/libax_sys.so" ]; then
 fi
 
 # 下载失败可以使用其他方式下载并放到在 $build_dir 目录，参考如下命令解压
-URL="https://developer.arm.com/-/media/Files/downloads/gnu-a/9.2-2019.12/binrel/gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu.tar.xz"
-FOLDER="gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu"
+# URL="https://developer.arm.com/-/media/Files/downloads/gnu-a/9.2-2019.12/binrel/gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu.tar.xz"
+# FOLDER="gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu"
 
-if ! command -v aarch64-none-linux-gnu-gcc >/dev/null 2>&1; then
-    # Check if the file exists
-    if [ ! -f "$FOLDER.tar.xz" ]; then
-        # Download the file
-        echo "Downloading $URL"
-        wget "$URL" -O "$FOLDER.tar.xz"
-    fi
+# if ! command -v aarch64-none-linux-gnu-gcc >/dev/null 2>&1; then
+#     # Check if the file exists
+#     if [ ! -f "$FOLDER.tar.xz" ]; then
+#         # Download the file
+#         echo "Downloading $URL"
+#         wget "$URL" -O "$FOLDER.tar.xz"
+#     fi
 
-    # Check if the folder exists
-    if [ ! -d "$FOLDER" ]; then
-        # Extract the file
-        echo "Extracting $FOLDER.tar.xz"
-        tar -xf "$FOLDER.tar.xz"
-    fi
+#     # Check if the folder exists
+#     if [ ! -d "$FOLDER" ]; then
+#         # Extract the file
+#         echo "Extracting $FOLDER.tar.xz"
+#         tar -xf "$FOLDER.tar.xz"
+#     fi
 
-    export PATH=$PATH:$PWD/$FOLDER/bin/
-    if ! command -v aarch64-none-linux-gnu-gcc >/dev/null 2>&1; then
-        echo "Error: aarch64-none-linux-gnu-gcc not found"
-        exit 1
-    fi
-fi
+#     export PATH=$PATH:$PWD/$FOLDER/bin/
+#     if ! command -v aarch64-none-linux-gnu-gcc >/dev/null 2>&1; then
+#         echo "Error: aarch64-none-linux-gnu-gcc not found"
+#         exit 1
+#     fi
+# fi
 
 # 开始编译
 cmake -DCMAKE_BUILD_TYPE=Release \

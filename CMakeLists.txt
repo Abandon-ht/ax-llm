@@ -38,12 +38,14 @@ endif()
 # ---------------------------------------------------------------------------
 option(BUILD_AX650 "Build AX650 on-chip backend  (produces: axllm)"       ON)
 option(BUILD_AXCL  "Build AXCL PCIe backend       (produces: axllm)" OFF)
+option(BUILD_ONNX_TTS "Build ONNX-only TTS test (no AXera dependency)" OFF)
 
-message(STATUS "BUILD_AX650 = ${BUILD_AX650}")
-message(STATUS "BUILD_AXCL  = ${BUILD_AXCL}")
+message(STATUS "BUILD_AX650    = ${BUILD_AX650}")
+message(STATUS "BUILD_AXCL     = ${BUILD_AXCL}")
+message(STATUS "BUILD_ONNX_TTS = ${BUILD_ONNX_TTS}")
 
-if(NOT BUILD_AX650 AND NOT BUILD_AXCL)
-    message(FATAL_ERROR "At least one of BUILD_AX650 or BUILD_AXCL must be ON")
+if(NOT BUILD_AX650 AND NOT BUILD_AXCL AND NOT BUILD_ONNX_TTS)
+    message(FATAL_ERROR "At least one of BUILD_AX650, BUILD_AXCL or BUILD_ONNX_TTS must be ON")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -183,8 +185,10 @@ if(BUILD_AX650)
     target_include_directories(qwen3_tts_debug PRIVATE ${BSP_MSP_DIR}/include)
     target_include_directories(qwen3_tts_ablation PRIVATE ${BSP_MSP_DIR}/include)
     # ONNX Runtime headers for ablation tool
-    set(ONNXRUNTIME_INCLUDE_DIR /home/m5stack/Workspace/kaldi/sherpa-onnx/build-axcl-linux-aarch64_m5stack_release/_deps/onnxruntime-src/include)
-    set(ONNXRUNTIME_LIB_DIR /home/m5stack/Workspace/kaldi/sherpa-onnx/build-axcl-linux-aarch64_m5stack_release/_deps/onnxruntime-src/lib)
+    set(ONNXRUNTIME_INCLUDE_DIR /home/ncy/Workspace/sherpa-onnx/build-aarch64-linux-gnu/_deps/onnxruntime-src/include)
+    set(ONNXRUNTIME_LIB_DIR /home/ncy/Workspace/sherpa-onnx/build-aarch64-linux-gnu/_deps/onnxruntime-src/lib)
+    # set(ONNXRUNTIME_INCLUDE_DIR /Users/ncy/Projects/sherpa-onnx/build/_deps/onnxruntime-src/include)
+    # set(ONNXRUNTIME_LIB_DIR /Users/ncy/Projects/sherpa-onnx/build/_deps/onnxruntime-src/lib)
     if(EXISTS ${ONNXRUNTIME_INCLUDE_DIR}/onnxruntime_cxx_api.h)
         target_include_directories(qwen3_tts_ablation PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
         message(STATUS "ONNX Runtime found for qwen3_tts_ablation: ${ONNXRUNTIME_INCLUDE_DIR}")
@@ -295,6 +299,73 @@ if(BUILD_AXCL)
     endif()
     install(TARGETS axllm DESTINATION bin)
     install(TARGETS llm_smoke DESTINATION bin)
+endif()
+
+# ---------------------------------------------------------------------------
+# ONNX-only TTS backend  →  qwen3_tts_onnx
+# ---------------------------------------------------------------------------
+if(BUILD_ONNX_TTS)
+    # --- ONNX Runtime discovery ---
+    if(DEFINED ENV{ONNXRUNTIME_DIR})
+        set(ONNXRUNTIME_DIR "$ENV{ONNXRUNTIME_DIR}")
+    endif()
+
+    # Candidate paths (search order)
+    set(ONNXRUNTIME_CANDIDATES
+        "${ONNXRUNTIME_DIR}"
+        # "/Users/ncy/Projects/sherpa-onnx/build/_deps/onnxruntime-src"
+        "/home/ncy/Workspace/sherpa-onnx/build-aarch64-linux-gnu/_deps/onnxruntime-src"
+        "/home/ncy/Workspace/sherpa-onnx/build/_deps/onnxruntime-src"
+        "/usr/local/onnxruntime"
+        "/usr/onnxruntime"
+    )
+
+    set(ONNXRUNTIME_FOUND FALSE)
+    foreach(CAND ${ONNXRUNTIME_CANDIDATES})
+        if(NOT CAND)
+            continue()
+        endif()
+        if(EXISTS ${CAND}/include/onnxruntime_cxx_api.h)
+            set(ONNXRUNTIME_INCLUDE_DIR ${CAND}/include)
+            if(EXISTS ${CAND}/lib/libonnxruntime.so)
+                set(ONNXRUNTIME_LIB_DIR ${CAND}/lib)
+                set(ONNXRUNTIME_LIB onnxruntime)
+                set(ONNXRUNTIME_FOUND TRUE)
+                message(STATUS "ONNX Runtime (shared) found: ${CAND}")
+                break()
+            elseif(EXISTS ${CAND}/lib/libonnxruntime.a)
+                set(ONNXRUNTIME_LIB_DIR ${CAND}/lib)
+                set(ONNXRUNTIME_LIB ${CAND}/lib/libonnxruntime.a)
+                set(ONNXRUNTIME_FOUND TRUE)
+                message(STATUS "ONNX Runtime (static) found: ${CAND}")
+                break()
+            endif()
+        endif()
+    endforeach()
+
+    if(NOT ONNXRUNTIME_FOUND)
+        message(FATAL_ERROR "ONNX Runtime not found. Set ONNXRUNTIME_DIR or install it.")
+    endif()
+
+    include_directories(${ONNXRUNTIME_INCLUDE_DIR})
+    link_directories(${ONNXRUNTIME_LIB_DIR})
+
+    add_executable(qwen3_tts_onnx tools/qwen3_tts_onnx.cpp)
+    target_include_directories(qwen3_tts_onnx PRIVATE src src/runner)
+
+    # Static onnxruntime may need extra system libs
+    set(ONNX_TTS_EXTRA_LIBS pthread dl)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        list(APPEND ONNX_TTS_EXTRA_LIBS rt)
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+        list(APPEND ONNX_TTS_EXTRA_LIBS "-framework CoreFoundation" "-framework Foundation")
+    endif()
+
+    target_link_libraries(qwen3_tts_onnx
+        ${ONNXRUNTIME_LIB}
+        ${ONNX_TTS_EXTRA_LIBS}
+    )
+    install(TARGETS qwen3_tts_onnx DESTINATION bin)
 endif()
 
 install(DIRECTORY ${CMAKE_SOURCE_DIR}/scripts/ DESTINATION bin/scripts)

@@ -529,8 +529,8 @@
             }
 
             // print frame
-            printf("frame=%d primary=%d", step, primary_code);
-            for (int j = 0; j < 15; ++j) printf(" res_%d=%d", j, frame_codes[j + 1]);
+            printf("frame=%d %d", step, primary_code);
+            for (int j = 0; j < 15; ++j) printf(" %d", frame_codes[j + 1]);
             printf("\n"); fflush(stdout);
 
             // 2. construct next_embed = codec_sum + txt_hidden[step]
