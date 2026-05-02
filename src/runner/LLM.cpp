@@ -106,6 +106,12 @@ struct LLM::Impl {
     std::vector<std::vector<unsigned short>> cp_k_cache;
     std::vector<std::vector<unsigned short>> cp_v_cache;
 
+    // TTS non-streaming pad vector (bf16, [hidden_size])
+    std::vector<unsigned short> tts_pad_vec_bf16;
+
+    // Debug dump directory
+    std::string debug_dump_dir_;
+
     // ---- small helpers ----
     static int post_process(LLMPostprocess &postprocess, unsigned short *p, int n, std::vector<int> &history, float *val = 0)
     {
@@ -1504,6 +1510,8 @@ struct LLM::Impl {
 
 #include "LLM_cp_tts_insert.inc"
 
+    void SetDebugDumpDir(const std::string &dir) { debug_dump_dir_ = dir; }
+
     std::vector<Content> Run(std::vector<Content> history, int output_max_token = -1)
     {
         return Run(std::move(history), {}, output_max_token);
@@ -1626,9 +1634,15 @@ std::vector<Content> LLM::Run(std::vector<Content> history, int output_max_token
 std::vector<Content> LLM::Run(std::vector<Content> history, const std::vector<MediaInputs> &media_inputs, int output_max_token) { return impl_->Run(std::move(history), media_inputs, output_max_token); }
 std::string LLM::Run(std::vector<unsigned short> &embed, int output_max_token) { return impl_->Run(embed, output_max_token); }
 
-bool LLM::RunTts(std::vector<unsigned short> &prefill_embeds, int max_new_tokens, int codec_eos_token_id, TtsDecodeResult &result)
+void LLM::SetTtsPadVec(const std::vector<unsigned short> &tts_pad_vec) {
+    impl_->tts_pad_vec_bf16 = tts_pad_vec;
+}
+
+void LLM::SetDebugDumpDir(const std::string &dir) { impl_->SetDebugDumpDir(dir); }
+
+bool LLM::RunTts(std::vector<unsigned short> &prefill_embeds, int max_new_tokens, int codec_eos_token_id, TtsDecodeResult &result, bool streaming)
 {
-    return impl_->RunTts(prefill_embeds, max_new_tokens, codec_eos_token_id, result);
+    return impl_->RunTts(prefill_embeds, max_new_tokens, codec_eos_token_id, result, streaming);
 }
 
 bool LLM::RunCpFrame(const std::vector<unsigned short> &last_hidden_bf16,
@@ -1643,7 +1657,8 @@ bool LLM::RunTtsWithCpCallback(std::vector<unsigned short> &prefill_embeds,
                                int max_new_tokens,
                                int codec_eos_token_id,
                                TtsDecodeResult &result,
-                               TtsCpCallback *cp_callback)
+                               TtsCpCallback *cp_callback,
+                               bool streaming)
 {
-    return impl_->RunTtsWithCpCallback(prefill_embeds, max_new_tokens, codec_eos_token_id, result, cp_callback);
+    return impl_->RunTtsWithCpCallback(prefill_embeds, max_new_tokens, codec_eos_token_id, result, cp_callback, streaming);
 }

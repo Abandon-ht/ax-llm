@@ -178,6 +178,88 @@ public:
         return PackResult(outputs, hidden_size, /*is_prefill=*/false);
     }
 
+    void DumpPrefillKVCache(const std::string &dir, const Result &result, int prefill_len) const
+    {
+        namespace fs = std::filesystem;
+        fs::create_directories(dir);
+        nlohmann::json meta;
+        meta["prefill_len"] = prefill_len;
+        meta["num_kv_tensors"] = (int)result.state.kv_cache.size();
+        nlohmann::json tensors = nlohmann::json::array();
+
+        for (size_t i = 0; i < result.state.kv_cache.size(); ++i) {
+            const auto &tensor = result.state.kv_cache[i];
+            auto shape = tensor.GetTensorTypeAndShapeInfo().GetShape();
+            const float *data = tensor.GetTensorData<float>();
+            int64_t total = 1;
+            for (auto s : shape) total *= s;
+
+            // Parse layer index and kv type from output name
+            int layer_idx = -1;
+            std::string kv_type;
+            if (i + 2 < prefill_out_names_str_.size()) {
+                const std::string &name = prefill_out_names_str_[i + 2];
+                std::string lower = name;
+                std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+                if (lower.find("key") != std::string::npos || lower.find(".k") != std::string::npos) kv_type = "k";
+                else if (lower.find("val") != std::string::npos || lower.find(".v") != std::string::npos) kv_type = "v";
+                // Extract first number as layer index
+                size_t pos = 0;
+                while (pos < name.size() && !std::isdigit(name[pos])) ++pos;
+                if (pos < name.size()) layer_idx = std::atoi(name.c_str() + pos);
+            }
+
+            std::vector<float> buf;
+            if (shape.size() == 4 && shape[0] == 1) {
+                // [1, num_heads, seq_len, head_dim] -> [seq_len, num_heads*head_dim]
+                int num_heads = static_cast<int>(shape[1]);
+                int seq_len   = static_cast<int>(shape[2]);
+                int head_dim  = static_cast<int>(shape[3]);
+                buf.resize((size_t)seq_len * num_heads * head_dim);
+                for (int s = 0; s < seq_len; ++s) {
+                    for (int h = 0; h < num_heads; ++h) {
+                        for (int d = 0; d < head_dim; ++d) {
+                            int src_idx = h * seq_len * head_dim + s * head_dim + d;
+                            int dst_idx = s * num_heads * head_dim + h * head_dim + d;
+                            buf[(size_t)dst_idx] = data[src_idx];
+                        }
+                    }
+                }
+            } else if (shape.size() == 3 && shape[0] == 1) {
+                // [1, seq_len, hidden_size]
+                int seq_len = static_cast<int>(shape[1]);
+                int hidden  = static_cast<int>(shape[2]);
+                buf.assign(data, data + (size_t)seq_len * hidden);
+            } else {
+                buf.assign(data, data + total);
+            }
+
+            char fname[256];
+            if (layer_idx >= 0 && !kv_type.empty()) {
+                snprintf(fname, sizeof(fname), "layer_%02d_%s.bin", layer_idx, kv_type.c_str());
+            } else {
+                snprintf(fname, sizeof(fname), "kv_%03zu.bin", i);
+            }
+            std::string path = (fs::path(dir) / fname).string();
+            FILE *fp = fopen(path.c_str(), "wb");
+            if (fp) {
+                fwrite(buf.data(), sizeof(float), buf.size(), fp);
+                fclose(fp);
+            }
+
+            nlohmann::json tinfo;
+            tinfo["filename"] = fname;
+            tinfo["name"] = (i + 2 < prefill_out_names_str_.size()) ? prefill_out_names_str_[i + 2] : "";
+            tinfo["orig_shape"] = shape;
+            tinfo["dump_shape"] = {(int)(buf.size() / prefill_len), prefill_len};
+            tensors.push_back(tinfo);
+        }
+        meta["tensors"] = tensors;
+        std::string meta_path = (fs::path(dir) / "meta.json").string();
+        std::ofstream ofs(meta_path);
+        ofs << meta.dump(2);
+    }
+
 private:
     Ort::Env env_;
     Ort::SessionOptions sess_opts_;
@@ -442,7 +524,7 @@ int main(int argc, char **argv)
 {
     if (argc < 5) {
         fprintf(stderr,
-            "Usage: qwen3_tts_ablation <model_dir> <onnx_dir> <npy_dir> --mode=<0|1|2|3> [max_new_tokens]\n"
+            "Usage: qwen3_tts_ablation <model_dir> <onnx_dir> <npy_dir> --mode=<0|1|2|3> [options] [max_new_tokens]\n"
             "\n"
             "  model_dir      AX650 talker model directory (with config.json)\n"
             "  onnx_dir       ONNX model directory (talker_prefill/decode/code_predictor etc.)\n"
@@ -451,6 +533,11 @@ int main(int argc, char **argv)
             "  --mode=1       ONNX Talker + AX CP   (ablate talker)\n"
             "  --mode=2       AX Talker + ONNX CP   (ablate CP)\n"
             "  --mode=3       ONNX Talker + ONNX CP (golden reference)\n"
+            "  --streaming    Enable streaming text input (default: non-streaming)\n"
+            "                 In streaming mode, decode uses trailing_text_hiddens\n"
+            "                 instead of tts_pad_vec for each AR step.\n"
+            "                 Trailing text is read from trailing_text_hiddens.bin\n"
+            "                 or extracted from prefill_embeds[trailing_start:].\n"
         );
         return 1;
     }
@@ -460,10 +547,13 @@ int main(int argc, char **argv)
     const std::string npy_dir   = argv[3];
     AblationMode mode = AblationMode::AX_AX;
     int max_new_tokens = 128;
+    bool streaming = false;
 
     for (int i = 4; i < argc; ++i) {
         if (strncmp(argv[i], "--mode=", 7) == 0) {
             mode = parse_mode(argv[i] + 7);
+        } else if (strcmp(argv[i], "--streaming") == 0) {
+            streaming = true;
         } else {
             max_new_tokens = std::atoi(argv[i]);
         }
@@ -473,6 +563,7 @@ int main(int argc, char **argv)
     printf("onnx_dir       : %s\n", onnx_dir.c_str());
     printf("npy_dir        : %s\n", npy_dir.c_str());
     printf("mode           : %d\n", static_cast<int>(mode));
+    printf("streaming      : %s\n", streaming ? "true" : "false");
     printf("max_new_tokens : %d\n", max_new_tokens);
 
     // ── 0. 读取 meta.json ──────────────────────────────────────────────────
@@ -483,7 +574,8 @@ int main(int argc, char **argv)
     const int S           = meta.value("S", 85);
     const int hidden_size = meta.value("hidden_size", 1024);
     const int audio_token_id = meta.value("audio_token_id", 151644);
-    printf("S=%d hidden_size=%d\n", S, hidden_size);
+    const int trailing_start = meta.value("trailing_start", 7);
+    printf("S=%d hidden_size=%d trailing_start=%d\n", S, hidden_size, trailing_start);
 
     // ── 1. 读取 prefill_embeds.bin (float32) ────────────────────────────────
     const std::string embed_path = npy_dir + "/prefill_embeds.bin";
@@ -495,6 +587,46 @@ int main(int argc, char **argv)
         reinterpret_cast<float *>(embed_raw.data()),
         reinterpret_cast<float *>(embed_raw.data()) + (size_t)S * hidden_size
     );
+
+    // ── 1.5 读取/构造 trailing_text_hiddens（流式输入用）────────────────────
+    std::vector<std::vector<float>> trailing_text_hiddens;
+    if (streaming) {
+        const std::string trail_path = npy_dir.back() == '/' ? npy_dir + "trailing_text_hiddens.bin"
+                                                             : npy_dir + "/trailing_text_hiddens.bin";
+        if (std::filesystem::exists(trail_path)) {
+            std::vector<uint8_t> trail_raw;
+            if (read_binary_file(trail_path, trail_raw)) {
+                int T = static_cast<int>(trail_raw.size() / (hidden_size * sizeof(float)));
+                const float *trail_data = reinterpret_cast<const float *>(trail_raw.data());
+                trailing_text_hiddens.resize(T);
+                for (int t = 0; t < T; ++t) {
+                    trailing_text_hiddens[t].assign(trail_data + t * hidden_size,
+                                                    trail_data + (t + 1) * hidden_size);
+                }
+                printf("Loaded trailing_text_hiddens.bin: T=%d\n", T);
+            }
+        } else if (S > trailing_start + 2) {
+            // Only extract from prefill_embeds if it looks like a mixed layout
+            // (e.g. S=85/93 where trailing text is appended after prefill core).
+            // For dedicated streaming prefill (S≈8), trailing must be provided
+            // separately via trailing_text_hiddens.bin.
+            int T = S - trailing_start;
+            trailing_text_hiddens.resize(T);
+            for (int t = 0; t < T; ++t) {
+                const float *src = prefill_embeds_fp32.data() + (trailing_start + t) * hidden_size;
+                trailing_text_hiddens[t].assign(src, src + hidden_size);
+            }
+            printf("Extracted trailing_text from prefill_embeds: trailing_start=%d T=%d\n",
+                   trailing_start, T);
+            printf("[WARNING] For true streaming, provide trailing_text_hiddens.bin "
+                   "or ensure prefill_embeds is mixed layout (S >> trailing_start).\n");
+        } else {
+            printf("[ERROR] streaming mode requires trailing_text_hiddens.bin, "
+                   "but file not found and prefill_embeds (S=%d) is too short to extract.\n", S);
+            printf("        Please generate streaming data or run without --streaming.\n");
+            return 1;
+        }
+    }
 
     // bf16 copy for AXModel talker
     std::vector<unsigned short> prefill_embeds_bf16((size_t)S * hidden_size);
@@ -519,6 +651,7 @@ int main(int argc, char **argv)
     LLM llm;
     if (!llm.Init(attr)) { ALOGE("LLM::Init failed"); return 1; }
     llm.ResetKVCache();
+    llm.SetDebugDumpDir(npy_dir);
 
     // ── 4. 初始化 ONNX 模型（如需要）────────────────────────────────────────
     std::unique_ptr<OnnxTalker> onnx_talker;
@@ -585,6 +718,31 @@ int main(int argc, char **argv)
         onnx_cp_callback.vocab_size = code_predictor_vocab_size;
     }
 
+    // ── 读取 tts_pad_vec.bin（所有模式共用，非流式 decode 必需）─────────────
+    const std::string pad_vec_path = npy_dir.back() == '/' ? npy_dir + "tts_pad_vec.bin"
+                                                           : npy_dir + "/tts_pad_vec.bin";
+    std::vector<uint8_t> pad_raw;
+    if (!read_binary_file(pad_vec_path, pad_raw)) return 1;
+    if (pad_raw.size() < sizeof(int32_t)) { ALOGE("tts_pad_vec too small"); return 1; }
+    int32_t pad_hidden = *reinterpret_cast<int32_t *>(pad_raw.data());
+    if (pad_hidden != hidden_size) {
+        ALOGE("tts_pad_vec hidden_size mismatch: file=%d, expected=%d", pad_hidden, hidden_size);
+        return 1;
+    }
+    const size_t pad_expected = sizeof(int32_t) + (size_t)hidden_size * sizeof(float);
+    if (pad_raw.size() != pad_expected) {
+        ALOGE("tts_pad_vec size mismatch: %zu vs expected %zu", pad_raw.size(), pad_expected);
+        return 1;
+    }
+    std::vector<float> tts_pad_vec(
+        reinterpret_cast<float *>(pad_raw.data() + sizeof(int32_t)),
+        reinterpret_cast<float *>(pad_raw.data() + sizeof(int32_t)) + hidden_size
+    );
+    // bf16 copy for AXModel non-streaming decode
+    std::vector<unsigned short> tts_pad_vec_bf16(hidden_size);
+    fp32_vec_to_bf16(tts_pad_vec.data(), tts_pad_vec_bf16.data(), hidden_size);
+    llm.SetTtsPadVec(tts_pad_vec_bf16);
+
     LLM::TtsDecodeResult tts_result;
     const auto t0 = std::chrono::steady_clock::now();
 
@@ -592,43 +750,51 @@ int main(int argc, char **argv)
     // Mode 0: AX Talker + AX CP  → 直接调用 LLM::RunTts
     // ═══════════════════════════════════════════════════════════════════════
     if (mode == AblationMode::AX_AX) {
-        bool ok = llm.RunTts(prefill_embeds_bf16, max_new_tokens, codec_eos_token_id, tts_result);
+        bool ok = llm.RunTts(prefill_embeds_bf16, max_new_tokens, codec_eos_token_id, tts_result, streaming);
         if (!ok) { ALOGE("RunTts failed"); }
     }
     // ═══════════════════════════════════════════════════════════════════════
     // Mode 2: AX Talker + ONNX CP  → 通过 callback 使用 ONNX CP
     // ═══════════════════════════════════════════════════════════════════════
     else if (mode == AblationMode::AX_ONNX) {
-        bool ok = llm.RunTtsWithCpCallback(prefill_embeds_bf16, max_new_tokens, codec_eos_token_id, tts_result, &onnx_cp_callback);
+        bool ok = llm.RunTtsWithCpCallback(prefill_embeds_bf16, max_new_tokens, codec_eos_token_id, tts_result, &onnx_cp_callback, streaming);
         if (!ok) { ALOGE("RunTtsWithCpCallback failed"); }
     }
     // ═══════════════════════════════════════════════════════════════════════
     // Mode 1/3: ONNX Talker + (AX CP or ONNX CP)  → 手动 loop
     // ═══════════════════════════════════════════════════════════════════════
     else {
-        // ── 读取 tts_pad_vec.bin (与 qwen3_tts_onnx.cpp 对齐) ────────────────
-        const std::string pad_vec_path = npy_dir.back() == '/' ? npy_dir + "tts_pad_vec.bin"
-                                                               : npy_dir + "/tts_pad_vec.bin";
-        std::vector<uint8_t> pad_raw;
-        if (!read_binary_file(pad_vec_path, pad_raw)) return 1;
-        if (pad_raw.size() < sizeof(int32_t)) { ALOGE("tts_pad_vec too small"); return 1; }
-        int32_t pad_hidden = *reinterpret_cast<int32_t *>(pad_raw.data());
-        if (pad_hidden != hidden_size) {
-            ALOGE("tts_pad_vec hidden_size mismatch: file=%d, expected=%d", pad_hidden, hidden_size);
-            return 1;
-        }
-        const size_t pad_expected = sizeof(int32_t) + (size_t)hidden_size * sizeof(float);
-        if (pad_raw.size() != pad_expected) {
-            ALOGE("tts_pad_vec size mismatch: %zu vs expected %zu", pad_raw.size(), pad_expected);
-            return 1;
-        }
-        std::vector<float> tts_pad_vec(
-            reinterpret_cast<float *>(pad_raw.data() + sizeof(int32_t)),
-            reinterpret_cast<float *>(pad_raw.data() + sizeof(int32_t)) + hidden_size
-        );
 
         // ONNX Talker prefill
         auto pr = onnx_talker->Prefill(prefill_embeds_fp32.data(), S, hidden_size);
+
+        // ---- Debug dump ONNX prefill outputs ----
+        {
+            std::string dir = npy_dir.back() == '/' ? npy_dir : npy_dir + "/";
+            std::string lh_path = dir + "debug_talker_prefill_last_hidden_onnx.bin";
+            FILE *fp = fopen(lh_path.c_str(), "wb");
+            if (fp) {
+                fwrite(pr.last_hidden.data(), sizeof(float), pr.last_hidden.size(), fp);
+                fclose(fp);
+                printf("[DEBUG] Saved ONNX prefill last_hidden -> %s\n", lh_path.c_str());
+            }
+            std::string lg_path = dir + "debug_talker_prefill_logits_onnx.bin";
+            fp = fopen(lg_path.c_str(), "wb");
+            if (fp) {
+                fwrite(pr.logits.data(), sizeof(float), pr.logits.size(), fp);
+                fclose(fp);
+                printf("[DEBUG] Saved ONNX prefill logits -> %s\n", lg_path.c_str());
+            }
+        }
+
+        // ---- Debug dump ONNX KV cache ----
+        {
+            std::string dir = npy_dir.back() == '/' ? npy_dir : npy_dir + "/";
+            std::string kvcache_dir = dir + "debug_talker_kvcache_onnx";
+            onnx_talker->DumpPrefillKVCache(kvcache_dir, pr, S);
+            printf("[DEBUG] Saved ONNX KV cache -> %s\n", kvcache_dir.c_str());
+        }
+
         int first_primary_code = SampleFromLogits(
             pr.logits.data(), static_cast<int32_t>(pr.logits.size()), talker_vocab_size,
             temperature, top_k, top_p, repetition_penalty,
@@ -678,11 +844,19 @@ int main(int argc, char **argv)
                 for (int j = 0; j < 15; ++j) printf(" %d", frame_codes[j + 1]);
                 printf("\n"); fflush(stdout);
 
-                // Build next talker input = codec_sum + tts_pad_vec
-                // (与 qwen3_tts_onnx.cpp non-streaming 模式一致)
+                // Build next talker input
+                // streaming:  codec_sum + trailing_text[step]
+                // non-streaming: codec_sum + tts_pad_vec
                 std::vector<float> next_in_fp32(hidden_size);
-                for (int d = 0; d < hidden_size; ++d) {
-                    next_in_fp32[d] = codec_sum_fp32[d] + tts_pad_vec[d];
+                if (streaming && step < static_cast<int>(trailing_text_hiddens.size())) {
+                    const auto &txt_hidden = trailing_text_hiddens[step];
+                    for (int d = 0; d < hidden_size; ++d) {
+                        next_in_fp32[d] = codec_sum_fp32[d] + txt_hidden[d];
+                    }
+                } else {
+                    for (int d = 0; d < hidden_size; ++d) {
+                        next_in_fp32[d] = codec_sum_fp32[d] + tts_pad_vec[d];
+                    }
                 }
 
                 // ONNX Talker decode
@@ -735,6 +909,7 @@ int main(int argc, char **argv)
             j["shape"] = { (int)tts_result.frames.size(), 16 };
             j["codec_eos_token_id"] = codec_eos_token_id;
             j["mode"] = static_cast<int>(mode);
+            j["streaming"] = streaming;
             std::ofstream ofs(out_meta);
             ofs << j.dump(2);
             printf("[SAVE]   %s\n", out_meta.c_str());

@@ -356,16 +356,18 @@
     bool RunTts(std::vector<unsigned short> &prefill_embeds,
                 int max_new_tokens,
                 int codec_eos_token_id,
-                TtsDecodeResult &result)
+                TtsDecodeResult &result,
+                bool streaming = true)
     {
-        return RunTtsWithCpCallback(prefill_embeds, max_new_tokens, codec_eos_token_id, result, nullptr);
+        return RunTtsWithCpCallback(prefill_embeds, max_new_tokens, codec_eos_token_id, result, nullptr, streaming);
     }
 
     bool RunTtsWithCpCallback(std::vector<unsigned short> &prefill_embeds,
                               int max_new_tokens,
                               int codec_eos_token_id,
                               TtsDecodeResult &result,
-                              LLM::TtsCpCallback *cp_callback)
+                              LLM::TtsCpCallback *cp_callback,
+                              bool streaming = true)
     {
         if (!cp_loaded) { ALOGE("CP not loaded, cannot RunTts"); return false; }
         b_stop.store(false, std::memory_order_relaxed);
@@ -482,6 +484,41 @@
                 memcpy(embed.data(), embed_tmp.data() + (input_num_token - 1) * _attr.tokens_embed_size, _attr.tokens_embed_size * sizeof(unsigned short));
         }
 
+        // ---- Debug dump: KV cache (after prefill, from decode group) ----
+        if (!debug_dump_dir_.empty())
+        {
+            std::string dir = debug_dump_dir_.back() == '/' ? debug_dump_dir_ : debug_dump_dir_ + "/";
+            std::string kvcache_dir = dir + "debug_talker_kvcache_ax";
+            std::filesystem::create_directories(kvcache_dir);
+            for (int m = 0; m < _attr.axmodel_num; m++)
+            {
+                auto &lyr = llama_layers[m];
+                int devid = LLM_DEVID(lyr);
+                auto &t_k = lyr.layer.get_input(decode_grpid, "K_cache");
+                auto &t_v = lyr.layer.get_input(decode_grpid, "V_cache");
+                size_t valid_kv_bytes = (size_t)input_embed_num * _attr.kv_cache_size * sizeof(unsigned short);
+
+                std::vector<unsigned short> k_bf16((size_t)input_embed_num * _attr.kv_cache_size);
+                std::vector<unsigned short> v_bf16((size_t)input_embed_num * _attr.kv_cache_size);
+                llm_d2h(k_bf16.data(), LLM_RADDR(t_k), valid_kv_bytes, devid);
+                llm_d2h(v_bf16.data(), LLM_RADDR(t_v), valid_kv_bytes, devid);
+
+                std::vector<float> k_fp32(k_bf16.size());
+                std::vector<float> v_fp32(v_bf16.size());
+                for (size_t i = 0; i < k_bf16.size(); ++i) k_fp32[i] = bfloat16(k_bf16[i]).fp32();
+                for (size_t i = 0; i < v_bf16.size(); ++i) v_fp32[i] = bfloat16(v_bf16[i]).fp32();
+
+                char path[1024];
+                snprintf(path, sizeof(path), "%s/layer_%02d_k.bin", kvcache_dir.c_str(), m);
+                FILE *fp = fopen(path, "wb");
+                if (fp) { fwrite(k_fp32.data(), sizeof(float), k_fp32.size(), fp); fclose(fp); }
+                snprintf(path, sizeof(path), "%s/layer_%02d_v.bin", kvcache_dir.c_str(), m);
+                fp = fopen(path, "wb");
+                if (fp) { fwrite(v_fp32.data(), sizeof(float), v_fp32.size(), fp); fclose(fp); }
+            }
+            ALOGI("[DEBUG] Saved AX KV cache -> %s", kvcache_dir.c_str());
+        }
+
         // ---- First post-process ----
         int next_token = -1;
         {
@@ -494,6 +531,38 @@
             next_token = post_process(postprocess, post_out, _attr.tokens_embed_num, token_ids, nullptr);
             token_ids.push_back(next_token);
             ALOGI("RunTts first primary_code=%d", next_token);
+        }
+
+        // ---- Debug dump: prefill last_hidden & logits ----
+        if (!debug_dump_dir_.empty())
+        {
+            std::string dir = debug_dump_dir_.back() == '/' ? debug_dump_dir_ : debug_dump_dir_ + "/";
+            // Save last hidden state (last token of prefill) as FP32
+            {
+                std::string path = dir + "debug_talker_prefill_last_hidden_ax.bin";
+                FILE *fp = fopen(path.c_str(), "wb");
+                if (fp) {
+                    std::vector<float> buf(_attr.tokens_embed_size);
+                    for (int d = 0; d < _attr.tokens_embed_size; ++d) buf[d] = bfloat16(embed[d]).fp32();
+                    fwrite(buf.data(), sizeof(float), buf.size(), fp);
+                    fclose(fp);
+                    ALOGI("[DEBUG] Saved AX prefill last_hidden -> %s", path.c_str());
+                }
+            }
+            // Save prefill logits (post_out of last token) as FP32
+            {
+                std::string path = dir + "debug_talker_prefill_logits_ax.bin";
+                FILE *fp = fopen(path.c_str(), "wb");
+                if (fp) {
+                    auto &t_out = llama_post.get_output("output");
+                    unsigned short *post_out = (unsigned short *)t_out.pVirAddr;
+                    std::vector<float> buf(_attr.tokens_embed_num);
+                    for (int d = 0; d < _attr.tokens_embed_num; ++d) buf[d] = bfloat16(post_out[d]).fp32();
+                    fwrite(buf.data(), sizeof(float), buf.size(), fp);
+                    fclose(fp);
+                    ALOGI("[DEBUG] Saved AX prefill logits -> %s", path.c_str());
+                }
+            }
         }
 
         // ---- Decode loop with CP ----
@@ -535,20 +604,38 @@
 
             // 2. construct next_embed = codec_sum + txt_hidden[step]
             std::vector<unsigned short> next_embed(_attr.tokens_embed_size, 0);
-            int txt_pos = trailing_start + step;
-            if (txt_pos < input_embed_num)
+            if (streaming)
             {
-                for (int d = 0; d < _attr.tokens_embed_size; ++d)
+                int txt_pos = trailing_start + step;
+                if (txt_pos < input_embed_num)
                 {
-                    float a = bfloat16(codec_sum_bf16[d]).fp32();
-                    float b = bfloat16(all_prefill_hidden[(size_t)txt_pos * _attr.tokens_embed_size + d]).fp32();
-                    next_embed[d] = bfloat16(a + b).data;
+                    for (int d = 0; d < _attr.tokens_embed_size; ++d)
+                    {
+                        float a = bfloat16(codec_sum_bf16[d]).fp32();
+                        float b = bfloat16(all_prefill_hidden[(size_t)txt_pos * _attr.tokens_embed_size + d]).fp32();
+                        next_embed[d] = bfloat16(a + b).data;
+                    }
+                }
+                else
+                {
+                    // no more txt_hidden, use codec_sum only (or pad)
+                    next_embed = codec_sum_bf16;
                 }
             }
             else
             {
-                // no more txt_hidden, use codec_sum only (or pad)
-                next_embed = codec_sum_bf16;
+                // non-streaming: next_embed = codec_sum + tts_pad_vec
+                if (tts_pad_vec_bf16.empty())
+                {
+                    ALOGE("RunTts non-streaming mode requires tts_pad_vec. Call SetTtsPadVec() before RunTts.");
+                    break;
+                }
+                for (int d = 0; d < _attr.tokens_embed_size; ++d)
+                {
+                    float a = bfloat16(codec_sum_bf16[d]).fp32();
+                    float b = bfloat16(tts_pad_vec_bf16[d]).fp32();
+                    next_embed[d] = bfloat16(a + b).data;
+                }
             }
 
             // 3. Talker decode step

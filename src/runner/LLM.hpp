@@ -132,7 +132,8 @@ public:
     bool RunTts(std::vector<unsigned short> &prefill_embeds,
                 int max_new_tokens,
                 int codec_eos_token_id,
-                TtsDecodeResult &result);
+                TtsDecodeResult &result,
+                bool streaming = true);
 
     // Standalone CP frame inference (for ablation experiments).
     // Requires cp_model_dir to be set during Init.
@@ -152,7 +153,14 @@ public:
                               int max_new_tokens,
                               int codec_eos_token_id,
                               TtsDecodeResult &result,
-                              TtsCpCallback *cp_callback);
+                              TtsCpCallback *cp_callback,
+                              bool streaming = true);
+
+    // Set tts_pad_vec for non-streaming TTS decode (bf16, [hidden_size]).
+    void SetTtsPadVec(const std::vector<unsigned short> &tts_pad_vec);
+
+    // Debug: set directory for dumping intermediate tensors
+    void SetDebugDumpDir(const std::string &dir);
 
 private:
     struct Impl;
