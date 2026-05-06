@@ -196,6 +196,32 @@ if(BUILD_AX650)
     install(TARGETS axllm DESTINATION bin)
     install(TARGETS llm_smoke DESTINATION bin)
     install(TARGETS qwen3_asr_debug DESTINATION bin)
+
+    # 新增静态库目标，供外部项目（如 sherpa-onnx）链接
+    add_library(axllm_static STATIC
+        ${COMMON_SOURCES}
+        src/runner/ax_model_runner/ax_model_runner_ax650.cpp
+    )
+    set_target_properties(axllm_static PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(axllm_static PUBLIC
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/src/runner
+        ${CMAKE_SOURCE_DIR}/src/runner/utils
+        ${BSP_MSP_DIR}/include
+    )
+    target_link_libraries(axllm_static PUBLIC
+        -L${BSP_MSP_DIR}/lib
+        ax_engine ax_interpreter ax_sys
+        pthread tokenizer openai_api::server
+        ${AXLLM_VISION_LIBS}
+    )
+    install(TARGETS axllm_static ARCHIVE DESTINATION lib)
+    install(FILES
+        src/runner/LLM.hpp
+        src/runner/VLMType.hpp
+        third_party/tokenizer.axera/include/BaseTokenizer.hpp
+        DESTINATION include
+    )
 endif()
 
 # ---------------------------------------------------------------------------
