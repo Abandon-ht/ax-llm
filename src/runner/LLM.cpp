@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <mutex>
 #include <numeric>
 #include <queue>
@@ -99,8 +100,10 @@ struct LLM::Impl {
     std::vector<std::vector<unsigned short>> cp_embed_tables;
     bool cp_loaded = false;
     int cp_prefill_gid = 1;
+    int cp_decode_gid = -1;
     int cp_prefill_token_num = 64;
     int cp_kv_cache_num = 64;
+    int cp_kv_dim = 256;
 
     // CP KV cache state: persists within a frame, reset at frame start
     std::vector<std::vector<unsigned short>> cp_k_cache;
@@ -108,6 +111,9 @@ struct LLM::Impl {
 
     // TTS non-streaming pad vector (bf16, [hidden_size])
     std::vector<unsigned short> tts_pad_vec_bf16;
+
+    // Talker post-norm gamma for CP input (fp32, [hidden_size])
+    std::vector<float> cp_norm_gamma;
 
     // Debug dump directory
     std::string debug_dump_dir_;

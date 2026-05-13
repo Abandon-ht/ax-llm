@@ -136,10 +136,8 @@ private:
         if (filtered_indices.empty())
             return 0;
 
-        // 使用thread_local随机数生成器（线程安全）
-        static thread_local std::mt19937 gen(std::random_device{}());
         std::discrete_distribution<int> dist(filtered_probs.begin(), filtered_probs.end());
-        return filtered_indices[dist(gen)];
+        return filtered_indices[dist(rng_)];
     }
     int top_p_sampling(const std::vector<float> &logits, float top_p)
     {
@@ -176,11 +174,8 @@ private:
             p /= filtered_sum;
         }
 
-        // Sample from the filtered distribution
-        std::random_device rd;
-        std::mt19937 gen(rd());
         std::discrete_distribution<int> dist(filtered_probs.begin(), filtered_probs.end());
-        return filtered_indices[dist(gen)];
+        return filtered_indices[dist(rng_)];
     }
 
     // 限制候选 token 数
@@ -210,11 +205,8 @@ private:
             p /= sum;
         }
 
-        // 采样
-        std::random_device rd;
-        std::mt19937 gen(rd());
         std::discrete_distribution<int> dist(filtered_probs.begin(), filtered_probs.end());
-        return filtered_indices[dist(gen)];
+        return filtered_indices[dist(rng_)];
     }
 
     bool enable_temperature = false;
@@ -234,8 +226,10 @@ private:
     bool enable_top_k_sampling = false;
     int top_k = 1;
 
+    std::mt19937 rng_;
+
 public:
-    LLMPostprocess() {}
+    LLMPostprocess() : rng_(std::random_device{}()) {}
 
     void set_temperature(bool enable, float temperature)
     {
@@ -268,6 +262,11 @@ public:
         enable_top_p_sampling = false;
         enable_top_k_sampling = enable;
         this->top_k = top_k;
+    }
+
+    void set_seed(int seed)
+    {
+        rng_.seed(static_cast<unsigned int>(seed));
     }
 
     bool load_config(std::string config_path)

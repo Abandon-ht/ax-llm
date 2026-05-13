@@ -179,16 +179,21 @@ if(BUILD_AX650)
         ${COMMON_SOURCES}
         src/runner/ax_model_runner/ax_model_runner_ax650.cpp
     )
+    add_executable(qwen3_tts_infer tools/qwen3_tts_infer.cpp
+        ${COMMON_SOURCES}
+        src/runner/ax_model_runner/ax_model_runner_ax650.cpp
+    )
     target_include_directories(axllm PRIVATE ${BSP_MSP_DIR}/include)
     target_include_directories(llm_smoke PRIVATE ${BSP_MSP_DIR}/include)
     target_include_directories(qwen3_asr_debug PRIVATE ${BSP_MSP_DIR}/include)
     target_include_directories(qwen3_tts_debug PRIVATE ${BSP_MSP_DIR}/include)
     target_include_directories(qwen3_tts_ablation PRIVATE ${BSP_MSP_DIR}/include)
+    target_include_directories(qwen3_tts_infer PRIVATE ${BSP_MSP_DIR}/include)
     # ONNX Runtime headers for ablation tool
-    set(ONNXRUNTIME_INCLUDE_DIR /home/ncy/Workspace/sherpa-onnx/build-aarch64-linux-gnu/_deps/onnxruntime-src/include)
-    set(ONNXRUNTIME_LIB_DIR /home/ncy/Workspace/sherpa-onnx/build-aarch64-linux-gnu/_deps/onnxruntime-src/lib)
-    # set(ONNXRUNTIME_INCLUDE_DIR /Users/ncy/Projects/sherpa-onnx/build/_deps/onnxruntime-src/include)
-    # set(ONNXRUNTIME_LIB_DIR /Users/ncy/Projects/sherpa-onnx/build/_deps/onnxruntime-src/lib)
+    set(ONNXRUNTIME_INCLUDE_DIR /home/m5stack/Workspace/kaldi/sherpa-onnx/build-aarch64-linux-gnu/_deps/onnxruntime-src/include)
+    set(ONNXRUNTIME_LIB_DIR /home/m5stack/Workspace/kaldi/sherpa-onnx/build-aarch64-linux-gnu/_deps/onnxruntime-src/lib)
+    # set(ONNXRUNTIME_INCLUDE_DIR /Users/m5stack/Projects/kaldi/sherpa-onnx/build/_deps/onnxruntime-src/include)
+    # set(ONNXRUNTIME_LIB_DIR /Users/m5stack/Projects/kaldi/sherpa-onnx/build/_deps/onnxruntime-src/lib)
     if(EXISTS ${ONNXRUNTIME_INCLUDE_DIR}/onnxruntime_cxx_api.h)
         target_include_directories(qwen3_tts_ablation PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
         message(STATUS "ONNX Runtime found for qwen3_tts_ablation: ${ONNXRUNTIME_INCLUDE_DIR}")
@@ -230,11 +235,18 @@ if(BUILD_AX650)
         pthread tokenizer openai_api::server
         ${AXLLM_VISION_LIBS}
     )
+    target_link_libraries(qwen3_tts_infer
+        -L${BSP_MSP_DIR}/lib
+        ax_engine ax_interpreter ax_sys
+        pthread tokenizer openai_api::server
+        ${AXLLM_VISION_LIBS}
+    )
     install(TARGETS axllm DESTINATION bin)
     install(TARGETS llm_smoke DESTINATION bin)
     install(TARGETS qwen3_asr_debug DESTINATION bin)
     install(TARGETS qwen3_tts_debug DESTINATION bin)
     install(TARGETS qwen3_tts_ablation DESTINATION bin)
+    install(TARGETS qwen3_tts_infer DESTINATION bin)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -313,9 +325,9 @@ if(BUILD_ONNX_TTS)
     # Candidate paths (search order)
     set(ONNXRUNTIME_CANDIDATES
         "${ONNXRUNTIME_DIR}"
-        # "/Users/ncy/Projects/sherpa-onnx/build/_deps/onnxruntime-src"
-        "/home/ncy/Workspace/sherpa-onnx/build-aarch64-linux-gnu/_deps/onnxruntime-src"
-        "/home/ncy/Workspace/sherpa-onnx/build/_deps/onnxruntime-src"
+        # "/Users/m5stack/Projects/kaldi/sherpa-onnx/build/_deps/onnxruntime-src"
+        "/home/m5stack/Workspace/kaldi/sherpa-onnx/build-aarch64-linux-gnu/_deps/onnxruntime-src"
+        "/home/m5stack/Workspace/kaldi/sherpa-onnx/build/_deps/onnxruntime-src"
         "/usr/local/onnxruntime"
         "/usr/onnxruntime"
     )

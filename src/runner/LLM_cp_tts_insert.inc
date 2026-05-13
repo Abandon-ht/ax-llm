@@ -24,17 +24,13 @@
                 for (int gid = 0; gid < cp_layers[0].layer.get_num_input_groups(); ++gid) {
                     ALOGI("  group %d inputs:", gid);
                     for (int k = 0; k < cp_layers[0].layer.get_num_inputs(); ++k) {
-                        try {
-                            auto &t = cp_layers[0].layer.get_input(gid, k);
-                            ALOGI("    in[%d]: name=%s shape=%s nSize=%d", k, t.sName.c_str(), shape_to_str2(t.vShape).c_str(), t.nSize);
-                        } catch (...) {}
+                        auto &t = cp_layers[0].layer.get_input(gid, k);
+                        ALOGI("    in[%d]: name=%s shape=%s nSize=%d", k, t.sName.c_str(), shape_to_str2(t.vShape).c_str(), t.nSize);
                     }
                     ALOGI("  group %d outputs:", gid);
                     for (int k = 0; k < cp_layers[0].layer.get_num_outputs(); ++k) {
-                        try {
-                            auto &t = cp_layers[0].layer.get_output(gid, k);
-                            ALOGI("    out[%d]: name=%s shape=%s nSize=%d", k, t.sName.c_str(), shape_to_str2(t.vShape).c_str(), t.nSize);
-                        } catch (...) {}
+                        auto &t = cp_layers[0].layer.get_output(gid, k);
+                        ALOGI("    out[%d]: name=%s shape=%s nSize=%d", k, t.sName.c_str(), shape_to_str2(t.vShape).c_str(), t.nSize);
                     }
                 }
             }
@@ -99,7 +95,7 @@
             if (!fin) { ALOGE("cp embed(%s) read failed", path); return false; }
         }
 
-        // detect prefill gid from first cp layer
+        // detect prefill/decode gid from first cp layer
         {
             auto &ref = cp_layers[0].layer;
             int best_gid = 0;
@@ -107,29 +103,91 @@
             int ng = ref.get_num_input_groups();
             for (int gid = 0; gid < ng; ++gid)
             {
-                try {
-                    auto &t_idx = ref.get_input(gid, "indices");
-                    size_t elems = t_idx.nSize / sizeof(unsigned int);
-                    if (elems > best_elems) { best_elems = elems; best_gid = gid; }
-                } catch (...) {}
+                auto &t_idx = ref.get_input(gid, "indices");
+                size_t elems = t_idx.nSize / sizeof(unsigned int);
+                if (elems > best_elems) { best_elems = elems; best_gid = gid; }
             }
             cp_prefill_gid = best_gid;
-            try {
+
+            int decode_gid = -1;
+            for (int gid = 0; gid < ng; ++gid)
+            {
+                auto &t_idx = ref.get_input(gid, "indices");
+                size_t elems = t_idx.nSize / sizeof(unsigned int);
+                if (elems == 1) { decode_gid = gid; break; }
+            }
+            cp_decode_gid = decode_gid;
+
+            {
                 auto &t_idx = ref.get_input(cp_prefill_gid, "indices");
                 if (!t_idx.vShape.empty()) cp_prefill_token_num = (int)t_idx.vShape.back();
                 else cp_prefill_token_num = (int)(t_idx.nSize / sizeof(unsigned int));
-            } catch (...) { cp_prefill_token_num = 64; }
+            }
             if (cp_prefill_token_num <= 1) cp_prefill_token_num = 64;
-            try {
+
+            cp_kv_cache_num = 0;
+            for (int gid = 0; gid < ng; ++gid) {
+                auto &t_k = ref.get_input(gid, "K_cache");
+                int detected = 0;
+                if (t_k.vShape.size() >= 2) {
+                    detected = (int)t_k.vShape[1];
+                } else if (cp_kv_dim > 0) {
+                    detected = (int)(t_k.nSize / sizeof(unsigned short)) / cp_kv_dim;
+                }
+                ALOGI("CP K_cache group %d shape=%s detected_kv_cache_num=%d",
+                      gid, shape_to_str2(t_k.vShape).c_str(), detected);
+                if (detected > cp_kv_cache_num) cp_kv_cache_num = detected;
+            }
+            if (cp_kv_cache_num <= 0) {
                 auto &t_mask = ref.get_input(cp_prefill_gid, "mask");
                 int mask_elems = (int)(t_mask.nSize / sizeof(unsigned short));
                 if (mask_elems > 0 && (mask_elems % cp_prefill_token_num) == 0)
                     cp_kv_cache_num = mask_elems / cp_prefill_token_num - cp_prefill_token_num;
                 else
                     cp_kv_cache_num = cp_prefill_token_num;
-            } catch (...) { cp_kv_cache_num = cp_prefill_token_num; }
-            ALOGI("CP prefill_gid=%d token_num=%d kv_cache_num=%d", cp_prefill_gid, cp_prefill_token_num, cp_kv_cache_num);
+            }
+            ALOGI("CP kv_cache_num=%d (max from all groups)", cp_kv_cache_num);
+            ALOGI("CP prefill_gid=%d decode_gid=%d token_num=%d kv_cache_num=%d", cp_prefill_gid, cp_decode_gid, cp_prefill_token_num, cp_kv_cache_num);
         }
+
+        // Detect cp_kv_dim from K_cache shape
+        {
+            auto &t_k = cp_layers[0].layer.get_input(cp_prefill_gid, "K_cache");
+            if (t_k.vShape.size() >= 3) {
+                cp_kv_dim = (int)t_k.vShape[2];
+            } else {
+                cp_kv_dim = (t_k.nSize / sizeof(unsigned short)) / cp_kv_cache_num;
+            }
+            ALOGI("CP kv_dim=%d (from K_cache shape)", cp_kv_dim);
+        }
+
+        // Pre-allocate CP KV caches
+        cp_k_cache.resize(5);
+        cp_v_cache.resize(5);
+        for (int m = 0; m < 5; ++m) {
+            cp_k_cache[m].assign((size_t)cp_kv_cache_num * cp_kv_dim, 0);
+            cp_v_cache[m].assign((size_t)cp_kv_cache_num * cp_kv_dim, 0);
+        }
+
+        // Load talker norm gamma for CP input
+        {
+            std::string talker_dir = (std::filesystem::path(cp_dir) / ".." / "talker").lexically_normal().string();
+            std::string norm_path = talker_dir + "/talker.model.norm.weight.bfloat16.bin";
+            std::ifstream fin(norm_path, std::ios::binary | std::ios::ate);
+            if (fin.is_open()) {
+                std::streamsize sz = fin.tellg();
+                fin.seekg(0, std::ios::beg);
+                int n = sz / sizeof(unsigned short);
+                cp_norm_gamma.resize(n);
+                std::vector<unsigned short> tmp(n);
+                fin.read((char*)tmp.data(), sz);
+                for (int i = 0; i < n; ++i) cp_norm_gamma[i] = bfloat16(tmp[i]).fp32();
+                ALOGI("Loaded talker norm gamma from %s, elems=%d", norm_path.c_str(), n);
+            } else {
+                ALOGW("Cannot load talker norm gamma from %s, CP input will be unnormalized!", norm_path.c_str());
+            }
+        }
+
         cp_loaded = true;
         return true;
     }
@@ -146,6 +204,21 @@
         cp_loaded = false;
     }
 
+    static inline void rmsnorm_bf16(unsigned short *dst, const unsigned short *src,
+                                     const float *gamma, int n, float eps=1e-6)
+    {
+        float sum_sq = 0;
+        for (int i = 0; i < n; ++i) {
+            float v = bfloat16(src[i]).fp32();
+            sum_sq += v * v;
+        }
+        float rms = std::sqrt(sum_sq / n + eps);
+        for (int i = 0; i < n; ++i) {
+            float v = bfloat16(src[i]).fp32();
+            dst[i] = bfloat16((v / rms) * gamma[i]).data;
+        }
+    }
+
     static inline void bf16_vec_to_fp32(const unsigned short *src, float *dst, int n)
     {
         for (int i = 0; i < n; ++i)
@@ -160,6 +233,59 @@
         for (int i = 0; i < n; ++i) dst[i] = bfloat16(src[i]).data;
     }
 
+    // Sherpa-ONNX style sampling for CP logits
+    static int CpSampleFromLogits(const std::vector<float> &logits,
+                                   float temperature,
+                                   int top_k,
+                                   float top_p)
+    {
+        if (logits.empty()) return 0;
+        std::vector<float> buf = logits;
+        const int V = static_cast<int>(buf.size());
+
+        if (temperature < 1e-6f) {
+            return static_cast<int>(std::max_element(buf.begin(), buf.end()) - buf.begin());
+        }
+
+        for (auto &v : buf) v /= temperature;
+
+        if (top_k > 0 && top_k < V) {
+            std::vector<float> tmp(buf.begin(), buf.end());
+            std::partial_sort(tmp.begin(), tmp.begin() + top_k, tmp.end(), std::greater<float>());
+            const float thr = tmp[top_k - 1];
+            for (auto &v : buf)
+                if (v < thr) v = -1e9f;
+        }
+
+        const float max_v = *std::max_element(buf.begin(), buf.end());
+        float sum = 0;
+        for (auto &v : buf) {
+            v = std::exp(v - max_v);
+            sum += v;
+        }
+        for (auto &v : buf) v /= sum;
+
+        if (top_p < 1.0f && top_p > 0.0f) {
+            std::vector<std::pair<float, int>> pi(V);
+            for (int i = 0; i < V; ++i) pi[i] = {buf[i], i};
+            std::sort(pi.begin(), pi.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+            float cum = 0;
+            int cut = V;
+            for (int i = 0; i < V; ++i) {
+                cum += pi[i].first;
+                if (cum >= top_p) { cut = i + 1; break; }
+            }
+            for (int i = cut; i < V; ++i) buf[pi[i].second] = 0.0f;
+            float ns = 0;
+            for (auto v : buf) ns += v;
+            if (ns > 0)
+                for (auto &v : buf) v /= ns;
+        }
+
+        thread_local std::mt19937 rng(std::random_device{}());
+        return static_cast<int>(std::discrete_distribution<int>(buf.begin(), buf.end())(rng));
+    }
+
     bool RunCpFrame(const std::vector<unsigned short> &last_hidden_bf16,
                     int primary_code,
                     std::vector<int> &out_frame_codes,
@@ -168,11 +294,11 @@
         if (!cp_loaded) return false;
         const int D = _attr.tokens_embed_size; // 1024
 
-        // Reset CP KV cache at the start of each frame (new primary token from talker)
-        cp_k_cache.clear();
-        cp_v_cache.clear();
-        cp_k_cache.resize(5);
-        cp_v_cache.resize(5);
+        // Reset CP KV cache at the start of each frame
+        for (int m = 0; m < 5; ++m) {
+            std::fill(cp_k_cache[m].begin(), cp_k_cache[m].end(), (unsigned short)0);
+            std::fill(cp_v_cache[m].begin(), cp_v_cache[m].end(), (unsigned short)0);
+        }
 
         // 1. primary embed via talker codec embedding table (first 3072 entries)
         std::vector<unsigned short> primary_embed(D);
@@ -188,15 +314,23 @@
         cp_ctx.insert(cp_ctx.end(), last_hidden_bf16.begin(), last_hidden_bf16.end());
         cp_ctx.insert(cp_ctx.end(), primary_embed.begin(), primary_embed.end());
 
+
         std::vector<unsigned short> mask_tmp((size_t)cp_prefill_token_num * (cp_kv_cache_num + cp_prefill_token_num));
         std::vector<unsigned int> idx_tmp((size_t)cp_prefill_token_num, 0);
         std::vector<unsigned short> embed_tmp((size_t)cp_prefill_token_num * D, 0);
-        std::vector<unsigned short> layer_out((size_t)cp_prefill_token_num * D, 0);
+
+        // Default CP sampling params (aligned with sherpa-onnx defaults)
+        const float cp_temperature = 0.9f;
+        const int cp_top_k = 50;
+        const float cp_top_p = 1.0f;
 
         for (int j = 0; j < 15; ++j)
         {
-            int seq_len = (j == 0) ? 2 : 1;
-            int history_len = (j == 0) ? 0 : (j + 1);
+            const bool is_prefill = (j == 0);
+            const int gid = is_prefill ? cp_prefill_gid : (cp_decode_gid >= 0 ? cp_decode_gid : cp_prefill_gid);
+            const int seq_len = is_prefill ? 2 : 1;
+            const int history_len = is_prefill ? 0 : (j + 1);
+            const int current_len = history_len + seq_len;
             if (history_len + seq_len > cp_prefill_token_num)
             {
                 ALOGE("CP history_len+seq_len(%d) > cp_prefill_token_num(%d)", history_len + seq_len, cp_prefill_token_num);
@@ -208,17 +342,25 @@
             std::fill(embed_tmp.begin(), embed_tmp.end(), (unsigned short)0);
             std::fill(idx_tmp.begin(), idx_tmp.end(), 0U);
 
-            // build mask with proper history_len for KV-cache attention
-            build_prefill_mask(mask_tmp, cp_kv_cache_num, cp_prefill_token_num, history_len, seq_len);
+            // build mask
+            if (is_prefill || cp_decode_gid < 0) {
+                // CP prefill mask is square (token_num x token_num), no KV cache dimension in mask shape
+                build_prefill_mask(mask_tmp, 0, cp_prefill_token_num, history_len, seq_len);
+            } else {
+                const int mask_cap = cp_kv_cache_num + 1;
+                const int mask_fill = std::min((int)mask_tmp.size(), mask_cap);
+                for (int i = 0; i < mask_fill; ++i) {
+                    mask_tmp[i] = (i <= history_len) ? bfloat16(0.f).data : bfloat16(-65536.f).data;
+                }
+            }
 
             // indices
             for (int i = 0; i < seq_len; ++i) idx_tmp[i] = (unsigned int)(history_len + i);
 
             // embed
-            if (j == 0) {
+            if (is_prefill) {
                 memcpy(embed_tmp.data(), cp_ctx.data(), seq_len * D * sizeof(unsigned short));
             } else {
-                // only the latest residual embedding is the new input
                 memcpy(embed_tmp.data(), cp_ctx.data() + (cp_ctx.size() - D), D * sizeof(unsigned short));
             }
 
@@ -227,7 +369,6 @@
             {
                 auto &lyr = cp_layers[m];
                 int devid = LLM_DEVID(lyr);
-                int gid = cp_prefill_gid;
                 auto &t_in = lyr.layer.get_input(gid, "input");
                 size_t in_copy = std::min((size_t)t_in.nSize, embed_tmp.size() * sizeof(unsigned short));
                 llm_h2d(LLM_WADDR(t_in), embed_tmp.data(), in_copy, devid);
@@ -238,61 +379,59 @@
                 size_t idx_copy = std::min((size_t)t_idx.nSize, idx_tmp.size() * sizeof(unsigned int));
                 llm_h2d(LLM_WADDR(t_idx), idx_tmp.data(), idx_copy, devid);
 
-                // K/V cache: zero on first step (frame start), reuse previous output otherwise
-                try {
+                // K/V cache input
+                {
                     auto &tk = lyr.layer.get_input(gid, "K_cache");
-                    if (tk.pVirAddr) {
-                        if (j == 0) {
-                            llm_memset(LLM_WADDR(tk), 0, tk.nSize, devid);
-                        } else if (!cp_k_cache[m].empty()) {
-                            llm_h2d(LLM_WADDR(tk), cp_k_cache[m].data(), std::min((size_t)tk.nSize, cp_k_cache[m].size() * sizeof(unsigned short)), devid);
-                        } else {
-                            llm_memset(LLM_WADDR(tk), 0, tk.nSize, devid);
-                        }
+                    if (is_prefill) {
+                        llm_h2d(LLM_WADDR(tk), cp_k_cache[m].data(),
+                                std::min((size_t)tk.nSize, cp_k_cache[m].size() * sizeof(unsigned short)), devid);
+                    } else {
+                        llm_h2d(LLM_WADDR(tk), cp_k_cache[m].data() + history_len * cp_kv_dim,
+                                std::min((size_t)tk.nSize, (size_t)cp_kv_dim * sizeof(unsigned short)), devid);
                     }
-                } catch (...) {}
-                try {
+                }
+                {
                     auto &tv = lyr.layer.get_input(gid, "V_cache");
-                    if (tv.pVirAddr) {
-                        if (j == 0) {
-                            llm_memset(LLM_WADDR(tv), 0, tv.nSize, devid);
-                        } else if (!cp_v_cache[m].empty()) {
-                            llm_h2d(LLM_WADDR(tv), cp_v_cache[m].data(), std::min((size_t)tv.nSize, cp_v_cache[m].size() * sizeof(unsigned short)), devid);
-                        } else {
-                            llm_memset(LLM_WADDR(tv), 0, tv.nSize, devid);
-                        }
+                    if (is_prefill) {
+                        llm_h2d(LLM_WADDR(tv), cp_v_cache[m].data(),
+                                std::min((size_t)tv.nSize, cp_v_cache[m].size() * sizeof(unsigned short)), devid);
+                    } else {
+                        llm_h2d(LLM_WADDR(tv), cp_v_cache[m].data() + history_len * cp_kv_dim,
+                                std::min((size_t)tv.nSize, (size_t)cp_kv_dim * sizeof(unsigned short)), devid);
                     }
-                } catch (...) {}
+                }
 
                 int inf_ret = lyr.layer.inference(gid);
                 if (inf_ret != 0) ALOGE("RunCpFrame layer m=%d inference failed ret=%d", m, inf_ret);
 
                 auto &t_out = lyr.layer.get_output(gid, "output");
-                llm_d2h(layer_out.data(), LLM_RADDR(t_out), std::min((size_t)t_out.nSize, layer_out.size() * sizeof(unsigned short)), devid);
-                memcpy(embed_tmp.data(), layer_out.data(), seq_len * D * sizeof(unsigned short));
+                llm_d2h(embed_tmp.data(), LLM_RADDR(t_out),
+                        std::min((size_t)t_out.nSize, (size_t)seq_len * D * sizeof(unsigned short)), devid);
 
-                // Save K/V cache output for next step within this frame
-                try {
+                // Update KV cache
+                if (is_prefill) {
                     auto &tk_out = lyr.layer.get_output(gid, "K_cache_out");
-                    size_t kv_words = tk_out.nSize / sizeof(unsigned short);
-                    if (cp_k_cache[m].size() < kv_words) cp_k_cache[m].resize(kv_words);
-                    llm_d2h(cp_k_cache[m].data(), LLM_RADDR(tk_out), tk_out.nSize, devid);
-                } catch (...) {}
-                try {
+                    llm_d2h(cp_k_cache[m].data(), LLM_RADDR(tk_out),
+                            std::min((size_t)tk_out.nSize, (size_t)seq_len * cp_kv_dim * sizeof(unsigned short)), devid);
                     auto &tv_out = lyr.layer.get_output(gid, "V_cache_out");
-                    size_t kv_words = tv_out.nSize / sizeof(unsigned short);
-                    if (cp_v_cache[m].size() < kv_words) cp_v_cache[m].resize(kv_words);
-                    llm_d2h(cp_v_cache[m].data(), LLM_RADDR(tv_out), tv_out.nSize, devid);
-                } catch (...) {}
+                    llm_d2h(cp_v_cache[m].data(), LLM_RADDR(tv_out),
+                            std::min((size_t)tv_out.nSize, (size_t)seq_len * cp_kv_dim * sizeof(unsigned short)), devid);
+                } else {
+                    auto &tk_out = lyr.layer.get_output(gid, "K_cache_out");
+                    llm_d2h(cp_k_cache[m].data() + (current_len - 1) * cp_kv_dim, LLM_RADDR(tk_out),
+                            std::min((size_t)tk_out.nSize, (size_t)cp_kv_dim * sizeof(unsigned short)), devid);
+                    auto &tv_out = lyr.layer.get_output(gid, "V_cache_out");
+                    llm_d2h(cp_v_cache[m].data() + (current_len - 1) * cp_kv_dim, LLM_RADDR(tv_out),
+                            std::min((size_t)tv_out.nSize, (size_t)cp_kv_dim * sizeof(unsigned short)), devid);
+                }
             }
 
             // take last position hidden state
             std::vector<unsigned short> hidden_step(D);
             memcpy(hidden_step.data(), embed_tmp.data() + (seq_len - 1) * D, D * sizeof(unsigned short));
 
-            // run CP post (if it has input named "input")
-            bool has_cp_post = true;
-            try {
+            // run CP post
+            {
                 auto &t_in = cp_post.get_input("input");
                 size_t in_copy = std::min((size_t)t_in.nSize, hidden_step.size() * sizeof(unsigned short));
                 llm_h2d(LLM_WADDR(t_in), hidden_step.data(), in_copy, cp_post.get_devid());
@@ -305,14 +444,11 @@
                     size_t copy_words = std::min(out_words, (size_t)D);
                     memcpy(hidden_step.data(), post_buf.data(), copy_words * sizeof(unsigned short));
                 }
-            } catch (const std::exception &e) {
-                has_cp_post = false;
-                ALOGI("RunCpFrame post skipped: %s", e.what());
             }
 
             // run lm_head_j -> logits [2048]
             auto &lmh = cp_lm_heads[j];
-            try {
+            {
                 auto &t_in = lmh.get_input("input");
                 size_t in_copy = std::min((size_t)t_in.nSize, hidden_step.size() * sizeof(unsigned short));
                 llm_h2d(LLM_WADDR(t_in), hidden_step.data(), in_copy, lmh.get_devid());
@@ -327,7 +463,7 @@
                 for (int i = 0; i < logits_n; ++i) {
                     if (logits_fp32[i] > max_logit) { max_logit = logits_fp32[i]; max_idx = i; }
                 }
-                int res_code = postprocess.apply(logits_fp32, {});
+                int res_code = CpSampleFromLogits(logits_fp32, cp_temperature, cp_top_k, cp_top_p);
                 out_frame_codes[j + 1] = res_code;
 
                 // lookup residual embed
@@ -345,11 +481,9 @@
                 }
                 // append to cp_ctx for next step
                 cp_ctx.insert(cp_ctx.end(), res_embed.begin(), res_embed.end());
-            } catch (const std::exception &e) {
-                ALOGE("CP lm_head %d failed: %s", j, e.what());
-                return false;
             }
         }
+
         return true;
     }
 
@@ -433,7 +567,14 @@
                 auto &lyr = llama_layers[m]; int devid = LLM_DEVID(lyr);
                 auto &t_idx = lyr.layer.get_input(prefill_grpid, "indices");
                 unsigned int *idx_ptr = (unsigned int *)t_idx.pVirAddr; memset(idx_ptr, 0, t_idx.nSize);
-                int idx_i = 0; for (int i = 0; i < input_num_token; ++i) idx_ptr[idx_i++] = (unsigned int)(history_len + i);
+                const int idx_elems = (int)(t_idx.nSize / sizeof(unsigned int));
+                int idx_rows = (idx_elems > 0 && _attr.prefill_token_num > 0) ? (idx_elems / _attr.prefill_token_num) : 1;
+                if (idx_rows <= 0) idx_rows = 1;
+                for (int r = 0; r < idx_rows; ++r) {
+                    for (int i = 0; i < input_num_token; ++i) {
+                        idx_ptr[r * _attr.prefill_token_num + i] = (unsigned int)(history_len + i);
+                    }
+                }
                 llm_h2d(LLM_WADDR(t_idx), idx_ptr, t_idx.nSize, devid);
                 auto &t_mask = lyr.layer.get_input(prefill_grpid, "mask");
                 if (is_linear_layer(m))
@@ -482,6 +623,17 @@
 
             if (p == prefill_split_num - 1)
                 memcpy(embed.data(), embed_tmp.data() + (input_num_token - 1) * _attr.tokens_embed_size, _attr.tokens_embed_size * sizeof(unsigned short));
+        }
+
+        // ---- Apply RMSNorm to all_prefill_hidden (align with Python normed hidden) ----
+        if (!cp_norm_gamma.empty()) {
+            for (int t = 0; t < input_embed_num; ++t) {
+                rmsnorm_bf16(
+                    all_prefill_hidden.data() + (size_t)t * _attr.tokens_embed_size,
+                    all_prefill_hidden.data() + (size_t)t * _attr.tokens_embed_size,
+                    cp_norm_gamma.data(), _attr.tokens_embed_size);
+            }
+            ALOGI("RunTts applied RMSNorm to all_prefill_hidden (%d tokens)", input_embed_num);
         }
 
         // ---- Debug dump: KV cache (after prefill, from decode group) ----
@@ -584,27 +736,41 @@
             // 1. CP frame
             std::vector<int> frame_codes;
             std::vector<unsigned short> codec_sum_bf16;
-            std::vector<unsigned short> last_hidden_bf16 = embed; // [D]
+
+            // Get txt_hidden from prefill as CP token0 (align with Python)
+            int txt_pos = trailing_start + step;
+            std::vector<unsigned short> txt_hidden_bf16(_attr.tokens_embed_size);
+            if (txt_pos < input_embed_num) {
+                for (int d = 0; d < _attr.tokens_embed_size; ++d) {
+                    txt_hidden_bf16[d] = all_prefill_hidden[(size_t)txt_pos * _attr.tokens_embed_size + d];
+                }
+                // all_prefill_hidden is already normed after prefill
+            } else {
+                // fallback: use normed embed if txt_pos exceeds prefill length
+                if (!cp_norm_gamma.empty()) {
+                    rmsnorm_bf16(txt_hidden_bf16.data(), embed.data(), cp_norm_gamma.data(), _attr.tokens_embed_size);
+                } else {
+                    txt_hidden_bf16 = embed;
+                }
+            }
             bool cp_ok = false;
             if (cp_callback) {
-                cp_ok = cp_callback->OnCpFrame(last_hidden_bf16, primary_code, frame_codes, codec_sum_bf16);
+                cp_ok = cp_callback->OnCpFrame(txt_hidden_bf16, primary_code, frame_codes, codec_sum_bf16);
             } else {
-                cp_ok = RunCpFrame(last_hidden_bf16, primary_code, frame_codes, codec_sum_bf16);
+                cp_ok = RunCpFrame(txt_hidden_bf16, primary_code, frame_codes, codec_sum_bf16);
             }
             if (!cp_ok)
             {
                 ALOGE("RunCpFrame failed at step %d", step);
                 break;
             }
-
             // print frame
             printf("frame=%d %d", step, primary_code);
             for (int j = 0; j < 15; ++j) printf(" %d", frame_codes[j + 1]);
             printf("\n"); fflush(stdout);
 
             // 2. construct next_embed = codec_sum + txt_hidden[step]
-            std::vector<unsigned short> next_embed(_attr.tokens_embed_size, 0);
-            if (streaming)
+            std::vector<unsigned short> next_embed(_attr.tokens_embed_size, 0);            if (streaming)
             {
                 int txt_pos = trailing_start + step;
                 if (txt_pos < input_embed_num)
