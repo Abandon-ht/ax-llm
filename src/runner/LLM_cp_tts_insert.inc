@@ -308,11 +308,9 @@
         out_frame_codes[0] = primary_code;
         out_codec_sum_bf16 = primary_embed;
 
-        // cp_ctx starts with [last_hidden, primary_embed]
-        std::vector<unsigned short> cp_ctx;
-        cp_ctx.reserve(17 * D);
-        cp_ctx.insert(cp_ctx.end(), last_hidden_bf16.begin(), last_hidden_bf16.end());
-        cp_ctx.insert(cp_ctx.end(), primary_embed.begin(), primary_embed.end());
+        // cp_ctx starts with [last_hidden] only (primary_embed is NOT fed into CP)
+        std::vector<unsigned short> cp_ctx = last_hidden_bf16;
+        cp_ctx.reserve(16 * D);
 
 
         std::vector<unsigned short> mask_tmp((size_t)cp_prefill_token_num * (cp_kv_cache_num + cp_prefill_token_num));
@@ -328,8 +326,8 @@
         {
             const bool is_prefill = (j == 0);
             const int gid = is_prefill ? cp_prefill_gid : (cp_decode_gid >= 0 ? cp_decode_gid : cp_prefill_gid);
-            const int seq_len = is_prefill ? 2 : 1;
-            const int history_len = is_prefill ? 0 : (j + 1);
+            const int seq_len = 1;
+            const int history_len = j;
             const int current_len = history_len + seq_len;
             if (history_len + seq_len > cp_prefill_token_num)
             {
@@ -357,9 +355,9 @@
             // indices
             for (int i = 0; i < seq_len; ++i) idx_tmp[i] = (unsigned int)(history_len + i);
 
-            // embed
+            // embed: cp_ctx[0..D-1] is last_hidden; appended res_embeds follow
             if (is_prefill) {
-                memcpy(embed_tmp.data(), cp_ctx.data(), seq_len * D * sizeof(unsigned short));
+                memcpy(embed_tmp.data(), cp_ctx.data(), D * sizeof(unsigned short));
             } else {
                 memcpy(embed_tmp.data(), cp_ctx.data() + (cp_ctx.size() - D), D * sizeof(unsigned short));
             }
@@ -379,26 +377,16 @@
                 size_t idx_copy = std::min((size_t)t_idx.nSize, idx_tmp.size() * sizeof(unsigned int));
                 llm_h2d(LLM_WADDR(t_idx), idx_tmp.data(), idx_copy, devid);
 
-                // K/V cache input
+                // K/V cache input: always pass full buffer (model uses indices/mask to locate)
                 {
                     auto &tk = lyr.layer.get_input(gid, "K_cache");
-                    if (is_prefill) {
-                        llm_h2d(LLM_WADDR(tk), cp_k_cache[m].data(),
-                                std::min((size_t)tk.nSize, cp_k_cache[m].size() * sizeof(unsigned short)), devid);
-                    } else {
-                        llm_h2d(LLM_WADDR(tk), cp_k_cache[m].data() + history_len * cp_kv_dim,
-                                std::min((size_t)tk.nSize, (size_t)cp_kv_dim * sizeof(unsigned short)), devid);
-                    }
+                    llm_h2d(LLM_WADDR(tk), cp_k_cache[m].data(),
+                            std::min((size_t)tk.nSize, cp_k_cache[m].size() * sizeof(unsigned short)), devid);
                 }
                 {
                     auto &tv = lyr.layer.get_input(gid, "V_cache");
-                    if (is_prefill) {
-                        llm_h2d(LLM_WADDR(tv), cp_v_cache[m].data(),
-                                std::min((size_t)tv.nSize, cp_v_cache[m].size() * sizeof(unsigned short)), devid);
-                    } else {
-                        llm_h2d(LLM_WADDR(tv), cp_v_cache[m].data() + history_len * cp_kv_dim,
-                                std::min((size_t)tv.nSize, (size_t)cp_kv_dim * sizeof(unsigned short)), devid);
-                    }
+                    llm_h2d(LLM_WADDR(tv), cp_v_cache[m].data(),
+                            std::min((size_t)tv.nSize, cp_v_cache[m].size() * sizeof(unsigned short)), devid);
                 }
 
                 int inf_ret = lyr.layer.inference(gid);
@@ -737,20 +725,19 @@
             std::vector<int> frame_codes;
             std::vector<unsigned short> codec_sum_bf16;
 
-            // Get txt_hidden from prefill as CP token0 (align with Python)
-            int txt_pos = trailing_start + step;
+            // CP input: normed hidden from current talker step (NOT prefill history token)
             std::vector<unsigned short> txt_hidden_bf16(_attr.tokens_embed_size);
-            if (txt_pos < input_embed_num) {
-                for (int d = 0; d < _attr.tokens_embed_size; ++d) {
-                    txt_hidden_bf16[d] = all_prefill_hidden[(size_t)txt_pos * _attr.tokens_embed_size + d];
-                }
-                // all_prefill_hidden is already normed after prefill
+            if (step == 0) {
+                // First frame: use last token of talker prefill (already normed)
+                memcpy(txt_hidden_bf16.data(),
+                       all_prefill_hidden.data() + (size_t)(input_embed_num - 1) * _attr.tokens_embed_size,
+                       _attr.tokens_embed_size * sizeof(unsigned short));
             } else {
-                // fallback: use normed embed if txt_pos exceeds prefill length
+                // Subsequent frames: use normed talker decode output
                 if (!cp_norm_gamma.empty()) {
                     rmsnorm_bf16(txt_hidden_bf16.data(), embed.data(), cp_norm_gamma.data(), _attr.tokens_embed_size);
                 } else {
-                    txt_hidden_bf16 = embed;
+                    memcpy(txt_hidden_bf16.data(), embed.data(), _attr.tokens_embed_size * sizeof(unsigned short));
                 }
             }
             bool cp_ok = false;
