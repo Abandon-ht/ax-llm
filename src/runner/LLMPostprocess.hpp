@@ -252,14 +252,12 @@ public:
 
     void set_top_p_sampling(bool enable, float top_p)
     {
-        enable_top_k_sampling = false;
         enable_top_p_sampling = enable;
         this->top_p = top_p;
     }
 
     void set_top_k_sampling(bool enable, int top_k)
     {
-        enable_top_p_sampling = false;
         enable_top_k_sampling = enable;
         this->top_k = top_k;
     }
@@ -299,34 +297,81 @@ public:
         top_k = config["top_k"];
         if (top_k < 1) top_k = 1;
 
-        // 互斥处理：若同时开启 top_p 与 top_k，则优先 top_p
-        if (enable_top_p_sampling && enable_top_k_sampling)
-        {
-            ALOGW("Both top_p and top_k enabled; prefer top_p and disable top_k");
-            enable_top_k_sampling = false;
-        }
+        // top_k 与 top_p 可同时开启，组合策略与 Sherpa-ONNX 一致
         return true;
+    }
+
+    // Sherpa-ONNX style sampling
+    int sample_from_logits(std::vector<float> &buf,
+                           float temperature,
+                           int top_k,
+                           float top_p,
+                           float repetition_penalty,
+                           const std::vector<int> &generated_ids)
+    {
+        const int V = static_cast<int>(buf.size());
+
+        if (repetition_penalty > 1.0f) {
+            for (int id : generated_ids) {
+                if (id >= 0 && id < V) {
+                    buf[id] = buf[id] > 0 ? buf[id] / repetition_penalty
+                                          : buf[id] * repetition_penalty;
+                }
+            }
+        }
+
+        if (temperature < 1e-6f) {
+            return static_cast<int>(std::max_element(buf.begin(), buf.end()) - buf.begin());
+        }
+
+        for (auto &v : buf) v /= temperature;
+
+        if (top_k > 0 && top_k < V) {
+            std::vector<float> tmp(buf.begin(), buf.end());
+            std::partial_sort(tmp.begin(), tmp.begin() + top_k, tmp.end(), std::greater<float>());
+            const float thr = tmp[top_k - 1];
+            for (auto &v : buf)
+                if (v < thr) v = -1e9f;
+        }
+
+        const float max_v = *std::max_element(buf.begin(), buf.end());
+        float sum = 0;
+        for (auto &v : buf) {
+            v = std::exp(v - max_v);
+            sum += v;
+        }
+        for (auto &v : buf) v /= sum;
+
+        if (top_p < 1.0f && top_p > 0.0f) {
+            std::vector<std::pair<float, int>> pi(V);
+            for (int i = 0; i < V; ++i) pi[i] = {buf[i], i};
+            std::sort(pi.begin(), pi.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+            float cum = 0;
+            int cut = V;
+            for (int i = 0; i < V; ++i) {
+                cum += pi[i].first;
+                if (cum >= top_p) { cut = i + 1; break; }
+            }
+            for (int i = cut; i < V; ++i) buf[pi[i].second] = 0.0f;
+            float ns = 0;
+            for (auto v : buf) ns += v;
+            if (ns > 0)
+                for (auto &v : buf) v /= ns;
+        }
+
+        std::discrete_distribution<int> dist(buf.begin(), buf.end());
+        return dist(rng_);
     }
 
     int apply(std::vector<float> &logits, const std::vector<int> &history)
     {
-        if (enable_temperature)
-            apply_temperature(logits, temperature);
-        if (enable_repetition_penalty)
-            apply_repetition_penalty(logits, history, repetition_penalty, penalty_window);
         if (enable_diversity_penalty)
             apply_diversity_penalty(logits, common_phrases, diversity_penalty);
 
-        if (enable_top_p_sampling)
-            return faster_top_p_sampling(logits, top_p);
-        else if (enable_top_k_sampling)
-            return top_k_sampling(logits, top_k);
-        else
-        {
-            // 最大值
-            float max_logit = *std::max_element(logits.begin(), logits.end());
-            int max_index = std::distance(logits.begin(), std::max_element(logits.begin(), logits.end()));
-            return max_index;
-        }
+        float temp = enable_temperature ? temperature : 1.0f;
+        int k = enable_top_k_sampling ? top_k : 0;
+        float p = enable_top_p_sampling ? top_p : 1.0f;
+        float rep_pen = enable_repetition_penalty ? repetition_penalty : 1.0f;
+        return sample_from_logits(logits, temp, k, p, rep_pen, history);
     }
 };

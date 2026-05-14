@@ -405,26 +405,20 @@ int main(int argc, char **argv)
     }
     printf("[INFO] LLM initialized OK\n\n");
 
-    // ── 4. 设置采样参数（覆盖 post_config.json 默认值）─────────────────────
+    // ── 4. 设置采样参数（仅在 CLI 显式指定或值与“关闭状态”不同时覆盖 post_config.json）─
     LLMPostprocess *postprocess = llm.getPostprocess();
     if (postprocess)
     {
-        postprocess->set_temperature(true, args.temperature);
-        if (args.top_p >= 1.0f || args.top_p <= 0.0f)
-        {
-            postprocess->set_top_k_sampling(true, args.top_k);
-        }
-        else
-        {
-            postprocess->set_top_p_sampling(true, args.top_p);
-        }
-        postprocess->set_repetition_penalty(true, args.repetition_penalty);
+        postprocess->set_temperature(args.temperature != 1.0f, args.temperature);
+        postprocess->set_top_k_sampling(args.top_k > 0, args.top_k);
+        postprocess->set_top_p_sampling(args.top_p > 0.0f && args.top_p < 1.0f, args.top_p);
+        postprocess->set_repetition_penalty(args.repetition_penalty != 1.0f, args.repetition_penalty);
         if (args.seed >= 0)
         {
             postprocess->set_seed(args.seed);
             printf("[INFO] Set random seed to %d\n", args.seed);
         }
-        printf("[INFO] Postprocess config overridden by CLI args\n");
+        printf("[INFO] Postprocess config set according to CLI / generation_config defaults\n");
     }
     else
     {

@@ -308,9 +308,11 @@
         out_frame_codes[0] = primary_code;
         out_codec_sum_bf16 = primary_embed;
 
-        // cp_ctx starts with [last_hidden] only (primary_embed is NOT fed into CP)
+        // cp_ctx starts with [last_hidden, primary_embed] to align with Python:
+        // Python CP prefill input is torch.cat((past_hidden, last_id_hidden), dim=1)
         std::vector<unsigned short> cp_ctx = last_hidden_bf16;
-        cp_ctx.reserve(16 * D);
+        cp_ctx.insert(cp_ctx.end(), primary_embed.begin(), primary_embed.end());
+        cp_ctx.reserve(17 * D);
 
 
         std::vector<unsigned short> mask_tmp((size_t)cp_prefill_token_num * (cp_kv_cache_num + cp_prefill_token_num));
@@ -326,8 +328,8 @@
         {
             const bool is_prefill = (j == 0);
             const int gid = is_prefill ? cp_prefill_gid : (cp_decode_gid >= 0 ? cp_decode_gid : cp_prefill_gid);
-            const int seq_len = 1;
-            const int history_len = j;
+            const int seq_len = is_prefill ? 2 : 1;
+            const int history_len = is_prefill ? 0 : (j + 1);
             const int current_len = history_len + seq_len;
             if (history_len + seq_len > cp_prefill_token_num)
             {
@@ -355,9 +357,9 @@
             // indices
             for (int i = 0; i < seq_len; ++i) idx_tmp[i] = (unsigned int)(history_len + i);
 
-            // embed: cp_ctx[0..D-1] is last_hidden; appended res_embeds follow
+            // embed: cp_ctx[0..D-1] is last_hidden, [D..2D-1] is primary_embed; appended res_embeds follow
             if (is_prefill) {
-                memcpy(embed_tmp.data(), cp_ctx.data(), D * sizeof(unsigned short));
+                memcpy(embed_tmp.data(), cp_ctx.data(), (size_t)seq_len * D * sizeof(unsigned short));
             } else {
                 memcpy(embed_tmp.data(), cp_ctx.data() + (cp_ctx.size() - D), D * sizeof(unsigned short));
             }
@@ -368,7 +370,7 @@
                 auto &lyr = cp_layers[m];
                 int devid = LLM_DEVID(lyr);
                 auto &t_in = lyr.layer.get_input(gid, "input");
-                size_t in_copy = std::min((size_t)t_in.nSize, embed_tmp.size() * sizeof(unsigned short));
+                size_t in_copy = std::min((size_t)t_in.nSize, (size_t)seq_len * D * sizeof(unsigned short));
                 llm_h2d(LLM_WADDR(t_in), embed_tmp.data(), in_copy, devid);
                 auto &t_mask = lyr.layer.get_input(gid, "mask");
                 size_t mask_copy = std::min((size_t)t_mask.nSize, mask_tmp.size() * sizeof(unsigned short));
