@@ -55,6 +55,12 @@ struct LLMAttrType {
     // Qwen3-TTS code-predictor directory (optional)
     std::string cp_model_dir;
 
+    // CP (code predictor / subtalker) sampling params
+    float cp_temperature = 0.9f;
+    int cp_top_k = 50;
+    float cp_top_p = 1.0f;
+    int cp_seed = -1;
+
     // ---- vision / VLM (optional, runtime switch by `vlm_type`) ----
     // If `vlm_type != VLMType::None`, vision encoder will be initialized and used.
     // See `VLMType` in `src/runner/VLMType.hpp`.

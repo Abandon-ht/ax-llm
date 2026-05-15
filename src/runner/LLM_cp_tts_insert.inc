@@ -233,57 +233,59 @@
         for (int i = 0; i < n; ++i) dst[i] = bfloat16(src[i]).data;
     }
 
-    // Sherpa-ONNX style sampling for CP logits
-    static int CpSampleFromLogits(const std::vector<float> &logits,
-                                   float temperature,
-                                   int top_k,
-                                   float top_p)
+    // Sampling for CP logits (aligned with Python float64 precision)
+    int CpSampleFromLogits(const std::vector<float> &logits,
+                            float temperature,
+                            int top_k,
+                            float top_p)
     {
         if (logits.empty()) return 0;
-        std::vector<float> buf = logits;
-        const int V = static_cast<int>(buf.size());
+        const int V = static_cast<int>(logits.size());
 
         if (temperature < 1e-6f) {
-            return static_cast<int>(std::max_element(buf.begin(), buf.end()) - buf.begin());
+            return static_cast<int>(std::max_element(logits.begin(), logits.end()) - logits.begin());
         }
 
-        for (auto &v : buf) v /= temperature;
+        // Convert to double for precision alignment with Python float64
+        std::vector<double> scores(V);
+        for (int i = 0; i < V; ++i) scores[i] = static_cast<double>(logits[i]) / temperature;
 
         if (top_k > 0 && top_k < V) {
-            std::vector<float> tmp(buf.begin(), buf.end());
-            std::partial_sort(tmp.begin(), tmp.begin() + top_k, tmp.end(), std::greater<float>());
-            const float thr = tmp[top_k - 1];
-            for (auto &v : buf)
-                if (v < thr) v = -1e9f;
+            std::vector<double> tmp(scores.begin(), scores.end());
+            std::partial_sort(tmp.begin(), tmp.begin() + top_k, tmp.end(), std::greater<double>());
+            const double thr = tmp[top_k - 1];
+            for (auto &v : scores)
+                if (v < thr) v = -1e30;
         }
 
-        const float max_v = *std::max_element(buf.begin(), buf.end());
-        float sum = 0;
-        for (auto &v : buf) {
+        const double max_v = *std::max_element(scores.begin(), scores.end());
+        double sum = 0;
+        for (auto &v : scores) {
             v = std::exp(v - max_v);
             sum += v;
         }
-        for (auto &v : buf) v /= sum;
+        sum = std::max(sum, 1e-12);
+        for (auto &v : scores) v /= sum;
 
         if (top_p < 1.0f && top_p > 0.0f) {
-            std::vector<std::pair<float, int>> pi(V);
-            for (int i = 0; i < V; ++i) pi[i] = {buf[i], i};
+            std::vector<std::pair<double, int>> pi(V);
+            for (int i = 0; i < V; ++i) pi[i] = {scores[i], i};
             std::sort(pi.begin(), pi.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
-            float cum = 0;
+            double cum = 0;
             int cut = V;
             for (int i = 0; i < V; ++i) {
                 cum += pi[i].first;
-                if (cum >= top_p) { cut = i + 1; break; }
+                if (cum > top_p) { cut = i + 1; break; }
             }
-            for (int i = cut; i < V; ++i) buf[pi[i].second] = 0.0f;
-            float ns = 0;
-            for (auto v : buf) ns += v;
-            if (ns > 0)
-                for (auto &v : buf) v /= ns;
+            if (cut == 0) cut = 1;
+            for (int i = cut; i < V; ++i) scores[pi[i].second] = 0.0;
+            double ns = 0;
+            for (auto v : scores) ns += v;
+            ns = std::max(ns, 1e-12);
+            for (auto &v : scores) v /= ns;
         }
 
-        thread_local std::mt19937 rng(std::random_device{}());
-        return static_cast<int>(std::discrete_distribution<int>(buf.begin(), buf.end())(rng));
+        return static_cast<int>(std::discrete_distribution<int>(scores.begin(), scores.end())(cp_rng_));
     }
 
     bool RunCpFrame(const std::vector<unsigned short> &last_hidden_bf16,
@@ -308,6 +310,10 @@
         out_frame_codes[0] = primary_code;
         out_codec_sum_bf16 = primary_embed;
 
+        // fp32 accumulation buffer for codec_sum (align with Python torch.sum fp32)
+        std::vector<float> codec_sum_fp32(D);
+        for (int d = 0; d < D; ++d) codec_sum_fp32[d] = bfloat16(primary_embed[d]).fp32();
+
         // cp_ctx starts with [last_hidden, primary_embed] to align with Python:
         // Python CP prefill input is torch.cat((past_hidden, last_id_hidden), dim=1)
         std::vector<unsigned short> cp_ctx = last_hidden_bf16;
@@ -319,10 +325,9 @@
         std::vector<unsigned int> idx_tmp((size_t)cp_prefill_token_num, 0);
         std::vector<unsigned short> embed_tmp((size_t)cp_prefill_token_num * D, 0);
 
-        // Default CP sampling params (aligned with sherpa-onnx defaults)
-        const float cp_temperature = 0.9f;
-        const int cp_top_k = 50;
-        const float cp_top_p = 1.0f;
+        const float cp_temperature = _attr.cp_temperature;
+        const int cp_top_k = _attr.cp_top_k;
+        const float cp_top_p = _attr.cp_top_p;
 
         for (int j = 0; j < 15; ++j)
         {
@@ -347,11 +352,18 @@
                 // CP prefill mask is square (token_num x token_num), no KV cache dimension in mask shape
                 build_prefill_mask(mask_tmp, 0, cp_prefill_token_num, history_len, seq_len);
             } else {
+                // CP decode mask layout matches Python decode_mask_cache row=current_len:
+                //   - cols [0 .. history_len-1]      : history KV slots, visible (strict <, not <=)
+                //   - cols [history_len .. mask_cap-2]: empty / future slots, masked
+                //   - col  [mask_cap - 1]            : current token's own "self" K computed in
+                //                                      this forward; always visible (Python's
+                //                                      `mask_2d[:, -1] = 0.0` override)
                 const int mask_cap = cp_kv_cache_num + 1;
                 const int mask_fill = std::min((int)mask_tmp.size(), mask_cap);
                 for (int i = 0; i < mask_fill; ++i) {
-                    mask_tmp[i] = (i <= history_len) ? bfloat16(0.f).data : bfloat16(-65536.f).data;
+                    mask_tmp[i] = (i < history_len) ? bfloat16(0.f).data : bfloat16(-65536.f).data;
                 }
+                if (mask_fill > 0) mask_tmp[mask_fill - 1] = bfloat16(0.f).data;
             }
 
             // indices
@@ -376,8 +388,18 @@
                 size_t mask_copy = std::min((size_t)t_mask.nSize, mask_tmp.size() * sizeof(unsigned short));
                 llm_h2d(LLM_WADDR(t_mask), mask_tmp.data(), mask_copy, devid);
                 auto &t_idx = lyr.layer.get_input(gid, "indices");
-                size_t idx_copy = std::min((size_t)t_idx.nSize, idx_tmp.size() * sizeof(unsigned int));
-                llm_h2d(LLM_WADDR(t_idx), idx_tmp.data(), idx_copy, devid);
+                {
+                    const int idx_total_elems = (int)(t_idx.nSize / sizeof(unsigned int));
+                    const int idx_per_row = (gid == cp_prefill_gid) ? cp_prefill_token_num : 1;
+                    const int n_rows = std::max(1, idx_total_elems / std::max(1, idx_per_row));
+                    std::vector<unsigned int> full_idx((size_t)idx_total_elems, 0U);
+                    for (int r = 0; r < n_rows; ++r) {
+                        for (int i = 0; i < seq_len && i < idx_per_row; ++i) {
+                            full_idx[(size_t)r * idx_per_row + i] = (unsigned int)(history_len + i);
+                        }
+                    }
+                    llm_h2d(LLM_WADDR(t_idx), full_idx.data(), t_idx.nSize, devid);
+                }
 
                 // K/V cache input: always pass full buffer (model uses indices/mask to locate)
                 {
@@ -462,17 +484,18 @@
                 {
                     memcpy(res_embed.data(), cp_embed_tables[j].data() + (size_t)res_code * D, D * sizeof(unsigned short));
                 }
-                // accumulate codec_sum (element-wise fp32 add, then convert back)
+                // accumulate codec_sum in fp32 (align with Python torch.sum fp32 accumulation)
                 for (int d = 0; d < D; ++d)
                 {
-                    float a = bfloat16(out_codec_sum_bf16[d]).fp32();
-                    float b = bfloat16(res_embed[d]).fp32();
-                    out_codec_sum_bf16[d] = bfloat16(a + b).data;
+                    codec_sum_fp32[d] += bfloat16(res_embed[d]).fp32();
                 }
                 // append to cp_ctx for next step
                 cp_ctx.insert(cp_ctx.end(), res_embed.begin(), res_embed.end());
             }
         }
+
+        // Convert fp32 codec_sum back to bf16 (single truncation, matching Python torch.sum)
+        for (int d = 0; d < D; ++d) out_codec_sum_bf16[d] = bfloat16(codec_sum_fp32[d]).data;
 
         return true;
     }
@@ -510,6 +533,7 @@
         std::vector<unsigned short> embed(_attr.tokens_embed_size, 0);
         std::vector<int> token_ids;
         int input_embed_num = (int)(prefill_embeds.size() / _attr.tokens_embed_size);
+        for (int i = 0; i < input_embed_num && i < (int)mask.size(); i++) mask[(size_t)i] = 0;
         int prefill_split_num = (int)ceil((double)input_embed_num / _attr.prefill_token_num);
         ALOGI("RunTts input_embed_num=%d prefill_split_num=%d", input_embed_num, prefill_split_num);
 
@@ -555,6 +579,26 @@
             {
                 if (b_stop.load(std::memory_order_relaxed)) break;
                 auto &lyr = llama_layers[m]; int devid = LLM_DEVID(lyr);
+
+                // ★ FIX: Propagate previous chunks' K/V history into the CURRENT chunk's
+                // prefill K_cache / V_cache input. Each chunk uses a different prefill_grpid,
+                // so the per-grpid pre_k buffer is NOT carried over by axengine. Python's
+                // StaticTalkerLayerRunner.prefill() (infer.py: k_input = k_caches[:, :start, :])
+                // does this explicitly. We mirror that by copying from the decode group's
+                // KV buffer, which has been populated by previous chunks via the d2d below.
+                if (p > 0) {
+                    auto &dec_k_src = lyr.layer.get_input(decode_grpid, "K_cache");
+                    auto &dec_v_src = lyr.layer.get_input(decode_grpid, "V_cache");
+                    auto &pre_k_dst = lyr.layer.get_input(prefill_grpid, "K_cache");
+                    auto &pre_v_dst = lyr.layer.get_input(prefill_grpid, "V_cache");
+                    size_t history_bytes = (size_t)history_len * _attr.kv_cache_size * sizeof(unsigned short);
+                    history_bytes = std::min(history_bytes, (size_t)pre_k_dst.nSize);
+                    if (history_bytes > 0) {
+                        llm_d2d(LLM_WADDR(pre_k_dst), LLM_RADDR(dec_k_src), history_bytes, devid);
+                        llm_d2d(LLM_WADDR(pre_v_dst), LLM_RADDR(dec_v_src), history_bytes, devid);
+                    }
+                }
+
                 auto &t_idx = lyr.layer.get_input(prefill_grpid, "indices");
                 unsigned int *idx_ptr = (unsigned int *)t_idx.pVirAddr; memset(idx_ptr, 0, t_idx.nSize);
                 const int idx_elems = (int)(t_idx.nSize / sizeof(unsigned int));
@@ -588,8 +632,18 @@
                 auto &pre_v = lyr.layer.get_input(prefill_grpid, "V_cache");
                 int kv_off = history_len * _attr.kv_cache_size;
                 size_t kv_sz = (size_t)input_num_token * _attr.kv_cache_size * sizeof(unsigned short);
-                llm_d2d((unsigned short *)LLM_WADDR(pre_k) + kv_off, LLM_RADDR(out_k), kv_sz, devid);
-                llm_d2d((unsigned short *)LLM_WADDR(pre_v) + kv_off, LLM_RADDR(out_v), kv_sz, devid);
+                // ★ FIX: Skip writing back to current grpid's pre_k when it would overflow
+                // (e.g. grpid=1 has pre_k.nSize=2048 but we'd want to write 256KB). This write
+                // is also useless since the next chunk uses a different grpid; history is
+                // propagated via the dec_k path above.
+                {
+                    size_t pre_k_max = (size_t)pre_k.nSize;
+                    size_t pre_off_b  = (size_t)kv_off * sizeof(unsigned short);
+                    if (pre_off_b + kv_sz <= pre_k_max) {
+                        llm_d2d((unsigned short *)LLM_WADDR(pre_k) + kv_off, LLM_RADDR(out_k), kv_sz, devid);
+                        llm_d2d((unsigned short *)LLM_WADDR(pre_v) + kv_off, LLM_RADDR(out_v), kv_sz, devid);
+                    }
+                }
                 // sync to decode group
                 auto &dec_k = lyr.layer.get_input(decode_grpid, "K_cache");
                 auto &dec_v = lyr.layer.get_input(decode_grpid, "V_cache");
@@ -712,6 +766,62 @@
         int step = 0;
         timer t_cost; t_cost.start();
         unsigned int decode_start = (unsigned int)input_embed_num;
+        // Diagnostic: log decode indices / mask tensor shape + is_linear_layer status
+        {
+            auto &t_idx0 = llama_layers[0].layer.get_input(decode_grpid, "indices");
+            auto &t_mask0 = llama_layers[0].layer.get_input(decode_grpid, "mask");
+            ALOGI("[diag] talker decode indices nSize=%d (elems=%d)  mask nSize=%d (elems=%d, host mask elems=%zu)",
+                  t_idx0.nSize, (int)(t_idx0.nSize / sizeof(unsigned int)),
+                  t_mask0.nSize, (int)(t_mask0.nSize / sizeof(unsigned short)), mask.size());
+            // Per-layer K_cache / V_cache shape + is_linear_layer status
+            int linear_count = 0;
+            for (int m = 0; m < _attr.axmodel_num; ++m) {
+                auto &tk_dec = llama_layers[m].layer.get_input(decode_grpid, "K_cache");
+                bool islin = is_linear_layer(m);
+                if (islin) ++linear_count;
+                if (m < 4 || m == _attr.axmodel_num - 1 || islin) {
+                    ALOGI("[diag] talker layer %02d: decode K_cache nSize=%d, is_linear=%d", m, tk_dec.nSize, (int)islin);
+                }
+            }
+            ALOGI("[diag] talker layers: total=%d, is_linear_count=%d, full_attention_interval=%d",
+                  _attr.axmodel_num, linear_count, _attr.full_attention_interval);
+            // Per-prefill-group pre_k sizes (to spot d2d overrun)
+            for (size_t gi = 0; gi < prefill_grpids_.size(); ++gi) {
+                int gid = prefill_grpids_[(size_t)gi];
+                auto &pre_k_g = llama_layers[0].layer.get_input(gid, "K_cache");
+                auto &out_k_g = llama_layers[0].layer.get_output(gid, "K_cache_out");
+                ALOGI("[diag] talker prefill gid=%d  pre_k.nSize=%d  out_k.nSize=%d  (kv_cap=%d)",
+                      gid, pre_k_g.nSize, out_k_g.nSize, prefill_capacity_by_gid(gid));
+            }
+            if (cp_loaded) {
+                auto &cp_idx0 = cp_layers[0].layer.get_input(cp_prefill_gid, "indices");
+                ALOGI("[diag] cp prefill_gid indices nSize=%d (elems=%d)",
+                      cp_idx0.nSize, (int)(cp_idx0.nSize / sizeof(unsigned int)));
+                if (cp_decode_gid >= 0) {
+                    auto &cp_idx1 = cp_layers[0].layer.get_input(cp_decode_gid, "indices");
+                    ALOGI("[diag] cp decode_gid indices nSize=%d (elems=%d)",
+                          cp_idx1.nSize, (int)(cp_idx1.nSize / sizeof(unsigned int)));
+                }
+            }
+        }
+        // Helper lambda: print fp32 stats of a bf16 vector (for codec_sum / next_embed / embed)
+        auto diag_bf16_stats = [&](const char *tag, int frame_idx, const unsigned short *p, int n) {
+            double sum = 0, sumsq = 0, sumabs = 0;
+            float mn = 1e30f, mx = -1e30f;
+            for (int i = 0; i < n; ++i) {
+                float v = bfloat16(p[i]).fp32();
+                sum += v; sumsq += (double)v * v; sumabs += std::abs(v);
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+            }
+            double mean = sum / n;
+            double l2 = std::sqrt(sumsq);
+            ALOGI("[diag] %s frame=%d  mean=%.5f  L2=%.4f  L1=%.4f  min=%.4f  max=%.4f  first5=[%.4f %.4f %.4f %.4f %.4f]",
+                  tag, frame_idx, mean, l2, sumabs, (double)mn, (double)mx,
+                  (double)bfloat16(p[0]).fp32(), (double)bfloat16(p[1]).fp32(),
+                  (double)bfloat16(p[2]).fp32(), (double)bfloat16(p[3]).fp32(),
+                  (double)bfloat16(p[4]).fp32());
+        };
         for (unsigned int indices = decode_start; indices < (unsigned int)_attr.max_token_len; indices++)
         {
             if (b_stop.load(std::memory_order_relaxed)) break;
@@ -753,6 +863,10 @@
                 ALOGE("RunCpFrame failed at step %d", step);
                 break;
             }
+            if (step < 2) {
+                diag_bf16_stats("txt_hidden_in", step, txt_hidden_bf16.data(), _attr.tokens_embed_size);
+                diag_bf16_stats("codec_sum    ", step, codec_sum_bf16.data(), _attr.tokens_embed_size);
+            }
             // print frame
             printf("frame=%d %d", step, primary_code);
             for (int j = 0; j < 15; ++j) printf(" %d", frame_codes[j + 1]);
@@ -792,6 +906,10 @@
                     next_embed[d] = bfloat16(a + b).data;
                 }
             }
+            if (step < 2) {
+                diag_bf16_stats("tts_pad_vec  ", step, tts_pad_vec_bf16.data(), _attr.tokens_embed_size);
+                diag_bf16_stats("next_embed   ", step, next_embed.data(), _attr.tokens_embed_size);
+            }
 
             // 3. Talker decode step
             {
@@ -808,7 +926,15 @@
                 if (b_stop.load(std::memory_order_relaxed)) break;
                 auto &lyr = llama_layers[m]; int devid = lyr.layer.get_devid();
                 auto &t_idx = lyr.layer.get_input(decode_grpid, "indices");
-                llm_h2d(LLM_WADDR(t_idx), &indices, sizeof(indices), devid);
+                {
+                    const int decode_idx_elems = (int)(t_idx.nSize / sizeof(unsigned int));
+                    if (decode_idx_elems > 1) {
+                        std::vector<unsigned int> decode_idx_buf((size_t)decode_idx_elems, indices);
+                        llm_h2d(LLM_WADDR(t_idx), decode_idx_buf.data(), t_idx.nSize, devid);
+                    } else {
+                        llm_h2d(LLM_WADDR(t_idx), &indices, sizeof(indices), devid);
+                    }
+                }
                 auto &t_mask = lyr.layer.get_input(decode_grpid, "mask");
                 if (is_linear_layer(m))
                 {
@@ -864,7 +990,12 @@
                 auto &lyr = llama_layers[m];
                 auto &in_k = lyr.layer.get_input(decode_grpid, "K_cache"); auto *in_k_ptr = (unsigned short *)in_k.pVirAddr;
                 auto &in_v = lyr.layer.get_input(decode_grpid, "V_cache"); auto *in_v_ptr = (unsigned short *)in_v.pVirAddr;
-                auto &t_idx = lyr.layer.get_input(decode_grpid, "indices"); memcpy(t_idx.pVirAddr, &indices, sizeof(indices));
+                auto &t_idx = lyr.layer.get_input(decode_grpid, "indices");
+                {
+                    const int decode_idx_elems = (int)(t_idx.nSize / sizeof(unsigned int));
+                    unsigned int *idx_ptr = (unsigned int *)t_idx.pVirAddr;
+                    for (int r = 0; r < decode_idx_elems; ++r) idx_ptr[r] = indices;
+                }
                 auto &t_mask = lyr.layer.get_input(decode_grpid, "mask");
                 if (is_linear_layer(m))
                 {
@@ -900,6 +1031,11 @@
 
             if (indices < mask.size()) mask[indices] = 0;
             token_ids.push_back(next_token);
+
+            if (step < 2) {
+                diag_bf16_stats("decode_raw_h ", step, embed.data(), _attr.tokens_embed_size);
+                ALOGI("[diag] step=%d  next_primary=%d", step, next_token);
+            }
 
             // save frame
             TtsFrame frame;

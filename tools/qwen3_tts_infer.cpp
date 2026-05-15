@@ -22,6 +22,9 @@
  *   --top_k <int>              top-k 采样（默认 50）
  *   --top_p <float>            top-p 采样（默认 1.0）
  *   --repetition_penalty <f>   重复惩罚（默认 1.05）
+ *   --cp_temperature <float>    CP 采样温度（默认 0.9）
+ *   --cp_top_k <int>            CP top-k（默认 50）
+ *   --cp_top_p <float>          CP top-p（默认 1.0）
  *   --streaming                启用流式模式
  *   --codec_eos_token_id <id>  EOS token ID（默认 2150）
  *   --output <prefix>          输出文件前缀（默认 <npy_dir>/output）
@@ -149,6 +152,9 @@ struct Args
     int top_k = 50;
     float top_p = 1.0f;
     float repetition_penalty = 1.05f;
+    float cp_temperature = 0.9f;
+    int cp_top_k = 50;
+    float cp_top_p = 1.0f;
     bool streaming = false;
     int codec_eos_token_id = 2150;
     std::string output_prefix;
@@ -169,6 +175,9 @@ static void print_usage(const char *prog)
         "  --top_k <int>              Top-k sampling (default: 50)\n"
         "  --top_p <float>            Top-p sampling (default: 1.0)\n"
         "  --repetition_penalty <f>   Repetition penalty (default: 1.05)\n"
+        "  --cp_temperature <float>  CP (subtalker) sampling temperature (default: 0.9)\n"
+        "  --cp_top_k <int>          CP top-k sampling (default: 50)\n"
+        "  --cp_top_p <float>        CP top-p sampling (default: 1.0)\n"
         "  --streaming                Enable streaming mode\n"
         "  --codec_eos_token_id <id>  Codec EOS token id (default: 2150)\n"
         "  --output <prefix>          Output file prefix (default: <npy_dir>/output)\n"
@@ -212,6 +221,18 @@ static bool parse_args(int argc, char **argv, Args &args)
         else if (strcmp(argv[i], "--repetition_penalty") == 0 && i + 1 < argc)
         {
             args.repetition_penalty = std::atof(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--cp_temperature") == 0 && i + 1 < argc)
+        {
+            args.cp_temperature = std::atof(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--cp_top_k") == 0 && i + 1 < argc)
+        {
+            args.cp_top_k = std::atoi(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--cp_top_p") == 0 && i + 1 < argc)
+        {
+            args.cp_top_p = std::atof(argv[++i]);
         }
         else if (strcmp(argv[i], "--streaming") == 0)
         {
@@ -263,6 +284,9 @@ int main(int argc, char **argv)
     printf("top_k                : %d\n", args.top_k);
     printf("top_p                : %.2f\n", args.top_p);
     printf("repetition_penalty   : %.2f\n", args.repetition_penalty);
+    printf("cp_temperature       : %.2f\n", args.cp_temperature);
+    printf("cp_top_k             : %d\n", args.cp_top_k);
+    printf("cp_top_p             : %.2f\n", args.cp_top_p);
     printf("streaming            : %s\n", args.streaming ? "true" : "false");
     printf("codec_eos_token_id   : %d\n", args.codec_eos_token_id);
     printf("output_prefix        : %s\n", args.output_prefix.c_str());
@@ -378,6 +402,11 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    attr.cp_temperature = args.cp_temperature;
+    attr.cp_top_k = args.cp_top_k;
+    attr.cp_top_p = args.cp_top_p;
+    attr.cp_seed = args.seed;
+
     // 推断 code-predictor 目录
     std::filesystem::path model_path(args.model_dir);
     std::string cp_model_dir = (model_path / ".." / "code-predictor").lexically_normal().string();
@@ -483,6 +512,9 @@ int main(int argc, char **argv)
             j["top_k"] = args.top_k;
             j["top_p"] = args.top_p;
             j["repetition_penalty"] = args.repetition_penalty;
+            j["cp_temperature"] = args.cp_temperature;
+            j["cp_top_k"] = args.cp_top_k;
+            j["cp_top_p"] = args.cp_top_p;
             j["seed"] = args.seed;
             std::ofstream ofs(out_meta);
             ofs << j.dump(2);

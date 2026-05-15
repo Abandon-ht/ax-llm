@@ -6,7 +6,7 @@
 #include <algorithm>
 #include <numeric>
 #include <cmath>
-#include <unordered_set>
+
 #include "utils/json.hpp"
 #include "utils/sample_log.h"
 
@@ -22,46 +22,7 @@ private:
         }
     }
 
-    // 防止重复
-    void apply_repetition_penalty(std::vector<float> &logits, const std::vector<int> &history, float penalty)
-    {
-        for (int token : history)
-        {
-            if (token < logits.size())
-            {
-                logits[token] = logits[token] < 0 ? logits[token] * penalty : logits[token] / penalty;
-            }
-        }
-    }
-
-    void apply_repetition_penalty(std::vector<float> &logits,
-                                  const std::vector<int> &generated_tokens,
-                                  float repetition_penalty,
-                                  int penalty_window)
-    {
-        if (repetition_penalty == 1.0f || generated_tokens.empty())
-        {
-            return; // 如果 penalty = 1.0 或者没有生成 token，则不进行修改
-        }
-
-        int start_idx = std::max(0, (int)generated_tokens.size() - penalty_window);
-        std::unordered_set<int> recent_tokens(generated_tokens.begin() + start_idx, generated_tokens.end());
-
-        for (int token : recent_tokens)
-        {
-            if (token < 0 || token >= logits.size())
-                continue;
-
-            if (logits[token] > 0)
-            {
-                logits[token] /= std::sqrt(repetition_penalty);
-            }
-            else
-            {
-                logits[token] *= std::sqrt(repetition_penalty);
-            }
-        }
-    }
+    
 
     // 增强多样性
     void apply_diversity_penalty(std::vector<float> &logits, const std::vector<int> &common_phrases, float penalty)
@@ -214,7 +175,6 @@ private:
 
     bool enable_repetition_penalty = false;
     float repetition_penalty = 1.0f;
-    int penalty_window = 20;
 
     bool enable_diversity_penalty = false;
     std::vector<int> common_phrases;
@@ -284,8 +244,6 @@ public:
 
         enable_repetition_penalty = config["enable_repetition_penalty"];
         repetition_penalty = config["repetition_penalty"];
-        penalty_window = config["penalty_window"];
-        if (penalty_window < 0) penalty_window = 0;
         if (repetition_penalty < 0.0f) repetition_penalty = 1.0f;
 
         enable_top_p_sampling = config["enable_top_p_sampling"];
@@ -301,7 +259,7 @@ public:
         return true;
     }
 
-    // Sherpa-ONNX style sampling
+    // Aligned with Python _select_next_code_from_logits (float64 precision)
     int sample_from_logits(std::vector<float> &buf,
                            float temperature,
                            int top_k,
@@ -314,7 +272,7 @@ public:
         if (repetition_penalty > 1.0f) {
             for (int id : generated_ids) {
                 if (id >= 0 && id < V) {
-                    buf[id] = buf[id] > 0 ? buf[id] / repetition_penalty
+                    buf[id] = buf[id] >= 0 ? buf[id] / repetition_penalty
                                           : buf[id] * repetition_penalty;
                 }
             }
@@ -324,42 +282,46 @@ public:
             return static_cast<int>(std::max_element(buf.begin(), buf.end()) - buf.begin());
         }
 
-        for (auto &v : buf) v /= temperature;
+        // Convert to double for precision alignment with Python float64
+        std::vector<double> scores(V);
+        for (int i = 0; i < V; ++i) scores[i] = static_cast<double>(buf[i]) / temperature;
 
         if (top_k > 0 && top_k < V) {
-            std::vector<float> tmp(buf.begin(), buf.end());
-            std::partial_sort(tmp.begin(), tmp.begin() + top_k, tmp.end(), std::greater<float>());
-            const float thr = tmp[top_k - 1];
-            for (auto &v : buf)
-                if (v < thr) v = -1e9f;
+            std::vector<double> tmp(scores.begin(), scores.end());
+            std::partial_sort(tmp.begin(), tmp.begin() + top_k, tmp.end(), std::greater<double>());
+            const double thr = tmp[top_k - 1];
+            for (auto &v : scores)
+                if (v < thr) v = -1e30;
         }
 
-        const float max_v = *std::max_element(buf.begin(), buf.end());
-        float sum = 0;
-        for (auto &v : buf) {
+        const double max_v = *std::max_element(scores.begin(), scores.end());
+        double sum = 0;
+        for (auto &v : scores) {
             v = std::exp(v - max_v);
             sum += v;
         }
-        for (auto &v : buf) v /= sum;
+        sum = std::max(sum, 1e-12);
+        for (auto &v : scores) v /= sum;
 
         if (top_p < 1.0f && top_p > 0.0f) {
-            std::vector<std::pair<float, int>> pi(V);
-            for (int i = 0; i < V; ++i) pi[i] = {buf[i], i};
+            std::vector<std::pair<double, int>> pi(V);
+            for (int i = 0; i < V; ++i) pi[i] = {scores[i], i};
             std::sort(pi.begin(), pi.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
-            float cum = 0;
+            double cum = 0;
             int cut = V;
             for (int i = 0; i < V; ++i) {
                 cum += pi[i].first;
-                if (cum >= top_p) { cut = i + 1; break; }
+                if (cum > top_p) { cut = i + 1; break; }
             }
-            for (int i = cut; i < V; ++i) buf[pi[i].second] = 0.0f;
-            float ns = 0;
-            for (auto v : buf) ns += v;
-            if (ns > 0)
-                for (auto &v : buf) v /= ns;
+            if (cut == 0) cut = 1;
+            for (int i = cut; i < V; ++i) scores[pi[i].second] = 0.0;
+            double ns = 0;
+            for (auto v : scores) ns += v;
+            ns = std::max(ns, 1e-12);
+            for (auto &v : scores) v /= ns;
         }
 
-        std::discrete_distribution<int> dist(buf.begin(), buf.end());
+        std::discrete_distribution<int> dist(scores.begin(), scores.end());
         return dist(rng_);
     }
 

@@ -1,6 +1,6 @@
 # Qwen3-TTS Python 与 C++ 推理逻辑详细对比
 
-> 基于 `scripts/infer.py`（Python）与 `src/runner/LLM_cp_tts_insert.inc`（C++，已修复后）的代码级逐模块对比。
+> 基于 `scripts/infer.py`（Python）与 `src/runner/LLM_cp_tts_insert.inc`（C++）的代码级逐模块对比。
 > 目的：确认 Talker 和 Code Predictor 的 AXModel 推理逻辑是否完全一致。
 
 ---
@@ -10,18 +10,18 @@
 | 模块 | 状态 | 说明 |
 |------|------|------|
 | **Talker Prefill** | ✅ 一致 | Mask、indices、KV cache、layer 计算逻辑对齐 |
-| **Talker Decode** | ✅ 一致 | Mask 更新、KV cache 写入、层间数据流对齐 |
+| **Talker Decode** | ✅ 一致（已修复） | P0 Bug 已修复：mask 现已标记 prefill 位置为可见（`mask[0..input_embed_num-1]=0`） |
 | **Talker Post / Logits** | ✅ 一致 | 输入都是 raw hidden，输出 logits |
 | **Talker 采样（Greedy）** | ✅ 一致 | Argmax 逻辑相同 |
-| **Talker 采样（Sample）** | ⚠️ 有差异 | Repetition penalty 公式、top_k/top_p 组合策略、随机数生成器不同 |
+| **Talker 采样（Sample）** | ✅ 一致（已修复） | Repetition penalty 公式已对齐（`< 0 ? * penalty : / penalty`，作用于全部历史）；Top-K + Top-P 组合策略已对齐（顺序：top_k → softmax → top_p） |
 | **CP 输入构造** | ✅ 一致（已修复） | 第 0 帧取 prefill last normed hidden，第 1+ 帧取 decode 后 rmsnorm |
 | **CP Prefill (j=0)** | ✅ 一致（已修复） | 输入仅 `last_hidden`（1 token），history_len=0 |
 | **CP Decode (j>0)** | ✅ 一致（已修复） | seq_len=1, history_len=j，KV cache 传完整 buffer |
 | **CP Post Norm** | ✅ 一致 | 都取 `output_norm`，取最后一个 token |
 | **CP LM Head** | ✅ 一致 | 输入 hidden_norm，输出 logits |
 | **CP 采样（Greedy）** | ✅ 一致 | Argmax 逻辑相同 |
-| **CP 采样（Sample）** | ⚠️ 有差异 | C++ 采样参数硬编码（0.9/50/1.0），随机数生成器不同 |
-| **Next Embed（Non-streaming）** | ✅ 一致 | `codec_sum + tts_pad_vec` |
+| **CP 采样（Sample）** | ✅ 一致（已修复） | CLI 参数 `--cp_temperature`/`--cp_top_k`/`--cp_top_p` 透传到 `RunCpFrame`，不再硬编码 |
+| **Next Embed（Non-streaming）** | ⚠️ 微小差异 | C++ bf16 逐步截断累加 codec_sum vs Python torch.sum（可能 fp32 中间值），有微小精度差异 |
 | **Next Embed（Streaming）** | ⚠️ 待确认 | C++ 使用 `all_prefill_hidden[trailing_start+step]`，Python 逻辑由原始模型控制 |
 
 ---
@@ -33,7 +33,7 @@
 | 步骤 | Python (`StaticTalkerLayerRunner.prefill`) | C++ (`RunTtsWithCpCallback` prefill 循环) | 是否一致 |
 |------|-------------------------------------------|------------------------------------------|----------|
 | **输入 embed** | `active_embeds[:, :valid_len, :]` 填入 `data[:, :valid_len, :]`，其余补 0 | `embed_tmp` 初始化为 0，`memcpy` 当前 chunk 的 tokens | ✅ |
-| **Indices** | `_position_ids_to_static_indices` 生成 `[3, padded_len]`，3 行重复 `history_len+i` | `idx_rows = idx_elems / prefill_token_num`，多行填充 `history_len+i` | ✅ |
+| **Indices** | `_position_ids_to_static_indices` 生成 `[3, padded_len]`，3 行重复 `history_len+i`，**padding 值 = 1**（`np.ones` 初始化） | `idx_rows = idx_elems / prefill_token_num`，多行填充 `history_len+i`，**padding 值 = 0**（`memset(idx_ptr, 0)` 初始化） | ⚠️ padding 值不同（1 vs 0），但 padding 位置被 causal mask 遮蔽，不影响推理结果 |
 | **Mask** | `[1, padded_len, padded_len]` causal：`-65536`，`[:, row, :row+1] = 0` | `build_prefill_mask`：`row[j < history_len] = 0; row[kv_cache_num .. kv_cache_num+r] = 0` | ✅ |
 | **KV Cache 初始值** | `np.zeros((1, kv_cache_len, kv_dim))` | Device buffer 分配时清零（runtime 保证） | ✅ |
 | **Layer 计算顺序** | 外层 layer → 内层 chunk | 外层 chunk → 内层 layer | ⚠️ 仅当 `prefill_split_num > 1` 时有差异。但 Qwen3-TTS 的 `input_embed_num=85 <= 128`，`prefill_split_num=1`，**实际等价** |
@@ -54,33 +54,23 @@
 |------|----------------------|-------------------|----------|
 | **输入 embed** | `decode_embed[:, -1:, :]` (bf16 numpy) | `next_embed` (bf16 vector) | ✅ |
 | **Indices** | `np.array([[position_index]], dtype=np.uint32)`，默认 `state.current_len` | `unsigned int indices = decode_start + step` | ✅ |
-| **Mask** | 预计算 `decode_mask_cache[state.current_len]`：`[kv_cache_len+1, 1, 1, kv_cache_len+1]`，允许看到 `0..t-1` 和 `last` | `mask` 数组：`mask[0..t-1]=0`（由前序步骤设置），`mask[last]=0`，当前位置仍为 `-65536` | ✅ |
+| **Mask** | 预计算 `decode_mask_cache[state.current_len]`：`mask[0..t-1]=0`（包括所有 prefill 位置），`mask[t]=-65536`，`mask[last]=0` | `mask` 数组：`mask[0..input_embed_num-1]=0`（**已修复**），`mask[decode_start..t-1]=0`，`mask[last]=0` | ✅ **已修复** |
 | **KV Cache 更新** | `state.k_caches[layer][:, current_len, :] = K_cache_out.reshape(1, kv_dim)` | `memcpy(in_k_ptr + indices * kv_cache_size, out_k.pVirAddr, kv_cache_size * 2)` | ✅ |
 | **层间传递** | NumPy 数组赋值 | `memcpy(embed.data(), t_out.pVirAddr, ...)` | ✅ |
 | **输出** | `data_decode` (raw hidden) | `embed` (raw hidden) | ✅ |
 
-#### 关于 Decode Mask 的详细说明
+#### 关于 Decode Mask 的修复（P0 Bug）
 
-Python 的 `_build_decode_mask_cache`：
-```python
-row_ids = np.arange(kv_cache_len + 1, dtype=np.int32)[:, None]
-col_ids = np.arange(kv_cache_len + 1, dtype=np.int32)[None, :]
-mask_2d = np.where(col_ids < row_ids, 0.0, -65536.0).astype(np.float32)
-mask_2d[:, -1] = 0.0
+**已修复**：在 `LLM_cp_tts_insert.inc` 的 `RunTtsWithCpCallback` 中，mask 初始化段后添加了：
+```cpp
+for (int i = 0; i < input_embed_num && i < (int)mask.size(); i++) mask[(size_t)i] = 0;
 ```
 
-当 decode step `t` 时，取 `decode_mask_cache[t]`：
-- `col < t`（历史）：**0**（可见）
-- `col == t`（自己）：**-65536**（不可见）— 因为自己的 KV 还未写入 cache
-- `col == last`：**0**（特殊处理）
-- `col > t` 且不是 last：**-65536**（不可见）
-
-C++ 的 `mask` 数组在 step `t` 时：
-- `mask[0..t-1] = 0`（之前步骤设置）
-- `mask[t] = -65536`（当前 step，还未写入 KV cache）
-- `mask[last] = 0`
-
-两者**完全一致**。Decode 时当前 token 的 query 不应该看到自己，因为自己的 K/V 是在当前 layer inference **结束后**才被写入 KV cache 的。这是标准的 decode causal mask。
+对照通用 `LLM.cpp` 的 `Run` 方法（line 1170）：
+```cpp
+for (int i = 0; i < precompute_len + input_embed_num && i < (int)mask.size(); i++) mask[(size_t)i] = 0;
+```
+TTS 场景下 `precompute_len=0`，所以等价于 `mask[0..input_embed_num-1] = 0`。
 
 ### 2.4 Talker Post → Primary Code
 
@@ -92,17 +82,21 @@ C++ 的 `mask` 数组在 step `t` 时：
 
 ### 2.5 Talker 采样
 
-| 步骤 | Python (`_select_next_code_from_logits`) | C++ (`LLMPostprocess::apply`) | 是否一致 |
-|------|-----------------------------------------|------------------------------|----------|
+| 步骤 | Python (`_select_next_code_from_logits`) | C++ (`LLMPostprocess::sample_from_logits`) | 是否一致 |
+|------|-----------------------------------------|------------------------------------------|----------|
 | **Greedy** | `np.argmax(scores)` | `std::max_element` | ✅ |
 | **Temperature** | `scores / temp` | `logit /= temperature` | ✅ |
-| **Top-K** | `np.partition(scores, -top_k)[-top_k]`，低于阈值的设 `-1e30`，然后 softmax + top-p | `partial_sort` 取 top_k，对 top_k logits 单独 softmax 采样，**不经过 top-p** | ❌ **不一致** |
-| **Top-P** | 对 full logits softmax，按 prob 排序，cumsum > top_p 的 drop，重新 normalize | `faster_top_p_sampling`：max heap 按 prob 排序，cumsum >= top_p 时 break，重新 normalize | ✅ 基本一致 |
-| **Top-K + Top-P** | 先 top-k 过滤，再 top-p，最后采样 | **互斥**：`set_top_p_sampling` 会关闭 `enable_top_k_sampling` | ❌ **不一致** |
-| **Repetition Penalty** | `logit < 0 ? logit * penalty : logit / penalty`（作用于**全部历史**） | `logit < 0 ? logit * sqrt(penalty) : logit / sqrt(penalty)`（作用于**最近 20 个 token**，`penalty_window=20`） | ❌ **不一致** |
+| **Top-K** | `np.partition(scores, -top_k)[-top_k]`，低于阈值设 `-1e30`，然后 softmax + top-p | `partial_sort` 取 top_k，低于阈值设 `-1e9f`，然后 softmax + top-p | ✅ **已对齐** |
+| **Top-P** | 对 full logits softmax，按 prob 排序，cumsum > top_p 的 drop，重新 normalize | `sort` + `cumsum` + cut + renormalize | ✅ **已对齐** |
+| **Top-K + Top-P** | 先 top-k 过滤，再 top-p，最后采样 | 先 top-k 过滤，再 softmax，再 top-p，最后采样 | ✅ **已对齐**（均为顺序组合） |
+| **Repetition Penalty** | `logit < 0 ? logit * penalty : logit / penalty`（作用于**全部历史**） | `logit >= 0 ? logit / penalty : logit * penalty`（作用于**全部历史**） | ✅ **已对齐**（公式等价：`< 0 → * penalty`，`>= 0 → / penalty`） |
 | **随机数** | `np.random.choice` (受 `np.random.seed` 控制) | `std::mt19937` (受 `set_seed` 控制) | ❌ 生成器不同，sample 结果不同 |
 
-**关键结论**：在 **Greedy 模式**（`do_sample=False` 或 `temperature=0`）下，Talker 采样**完全一致**。在 Sample 模式下，由于 penalty 公式、top_k/top_p 组合策略、随机数生成器的差异，结果**可能不同**。建议对齐验证时使用 greedy。
+**关键结论**：在 **Greedy 模式**（`do_sample=False` 或 `temperature=0`）下，Talker 采样**完全一致**。在 **Sample 模式**下，采样策略（repetition penalty / top_k / top_p 组合）**已对齐**，仅随机数生成器不同。
+
+**修复说明**：
+- 编号1（repetition penalty）：移除了使用 `sqrt(penalty)` + `penalty_window=20` 的死代码变体，确保唯一路径 `sample_from_logits` 使用与 Python 一致的公式（`< 0 → * penalty`，`>= 0 → / penalty`，作用于全部历史）。
+- 编号2（Top-K/Top-P 组合）：`sample_from_logits` 已支持 top_k + top_p 顺序组合（top_k → softmax → top_p），与 Python 策略一致。`set_top_p_sampling` **不会**关闭 `enable_top_k_sampling`。
 
 ---
 
@@ -168,9 +162,12 @@ C++ 的 `mask` 数组在 step `t` 时：
 | **Top-K** | `np.partition(scores, -top_k)[-top_k]`，低于阈值设 `-1e30` | `partial_sort` + `std::greater`，低于阈值设 `-1e9f` | ✅ 基本一致 |
 | **Top-P** | `argsort` + `cumsum` + drop | `sort` + `cumsum` + cut | ✅ 基本一致 |
 | **随机数** | `np.random.choice` | `std::discrete_distribution` + `std::mt19937` | ❌ 生成器不同 |
-| **参数来源** | CLI 透传（temperature/top_k/top_p/do_sample） | **硬编码** `cp_temperature=0.9f, cp_top_k=50, cp_top_p=1.0f` | ❌ **不一致** |
+| **参数来源** | CLI 透传（`--subtalker_temperature`/`--subtalker_top_k`/`--subtalker_top_p`/`--subtalker_dosample`） | CLI 透传（`--cp_temperature`/`--cp_top_k`/`--cp_top_p`），通过 `LLMAttrType` 传入 `RunCpFrame` | ✅ **已对齐** |
 
-**关键结论**：CP 在 greedy 模式下完全一致。在 sample 模式下，C++ 的 CP 采样参数**未从 CLI 透传**（始终使用 0.9/50/1.0），且随机数生成器不同。
+**关键结论**：CP 在 greedy 模式下完全一致。在 sample 模式下，CP 采样参数**已从 CLI 透传**（编号3已修复），仅随机数生成器不同。
+
+**修复说明**：
+- 编号3（CP 采样参数硬编码）：`RunCpFrame` 中的 `cp_temperature=0.9f, cp_top_k=50, cp_top_p=1.0f` 硬编码已替换为从 `LLMAttrType` 读取（`_attr.cp_temperature`/`_attr.cp_top_k`/`_attr.cp_top_p`）。`qwen3_tts_infer.cpp` 新增 `--cp_temperature`、`--cp_top_k`、`--cp_top_p` CLI 参数，通过 `LLMAttrType` 透传到内部 `RunCpFrame`。默认值与 Python `--subtalker_temperature`/`--subtalker_top_k`/`--subtalker_top_p` 默认值一致（0.9/50/1.0）。
 
 ---
 
@@ -178,24 +175,35 @@ C++ 的 `mask` 数组在 step `t` 时：
 
 | 模式 | Python | C++ | 是否一致 |
 |------|--------|-----|----------|
-| **Non-streaming** | `next_embed = codec_sum + tts_pad_embed` | `next_embed[d] = bf16(codec_sum[d] + tts_pad_vec[d])` | ✅（前提是 `tts_pad_vec.bin` 是从 Python 同一模型导出的） |
-| **Streaming** | 由 Qwen3TTSModel 内部控制，通常为 `codec_sum + txt_hidden[step]` | `codec_sum + all_prefill_hidden[trailing_start + step]` | ⚠️ **待确认**。C++ 使用 prefill 历史中的 text token hidden 作为 `txt_hidden`。如果 Python 的 streaming 模式也是从 prefill 历史中取对应位置的 hidden，则一致；否则可能不一致。 |
+| **Non-streaming** | `next_embed = codec_sum + tts_pad_embed` | `next_embed[d] = bf16(codec_sum[d] + tts_pad_vec[d])` — **但 codec_sum 构造方式不同**：Python `torch.sum(codec_hiddens)` 可能使用 fp32 中间值累加，C++ 逐个 bf16→fp32 累加并截断回 bf16 | ⚠️ 微小精度差异 |
+| **Streaming** | 由 Qwen3TTSModel 内部控制，通常为 `codec_sum + txt_hidden[step]` | `codec_sum + all_prefill_hidden[trailing_start + step]` | ⚠️ **待确认** |
 
 ---
 
-## 五、仍未修复 / 无法确认的差异清单
+## 五、仍存在的差异清单
 
-| 编号 | 差异点 | 影响 | 建议 |
+| 编号 | 差异点 | 影响 | 说明 |
 |------|--------|------|------|
-| 1 | **Talker Sample 模式**：repetition penalty 公式不同（`penalty` vs `sqrt(penalty)`），window 策略不同 | Sample 模式下 primary_code 可能不同 | Greedy 验证时无影响；如需 sample 对齐，需统一 penalty 实现 |
-| 2 | **Talker Top-K/Top-P 互斥**：Python 支持组合，C++ 互斥 | Sample 模式下可能不同 | Greedy 时无影响 |
-| 3 | **CP 采样参数硬编码**：C++ `RunCpFrame` 中写死 0.9/50/1.0，不从 CLI 透传 | Sample 模式下 residual codes 可能不同 | Greedy 时无影响；如需 sample 对齐，需将 CLI 参数传入 `RunCpFrame` |
-| 4 | **Streaming `txt_hidden` 来源**：C++ 从 `all_prefill_hidden[txt_pos]` 取，Python 逻辑由原始模型控制 | Streaming 模式下 talker decode 输入可能不同 | 建议用 non-streaming 模式做 greedy 对齐验证 |
-| 5 | **数值精度**：PyTorch RMSNorm vs C++ `rmsnorm_bf16` 的 bf16↔fp32 截断顺序 | hidden state 有 <1e-4 误差，logits 可能有微小偏差 | 通常 cosine > 0.999 即认为对齐；greedy 下 argmax 通常不受影响 |
+| 4 | **Prefill Indices Padding**：Python padding 值=1（`np.ones`），C++ padding 值=0（`memset(0)`） | padding 位置被 causal mask 遮蔽，不影响推理结果 | 无需修复，但需注意 |
+| 5 | **codec_sum bf16 累加精度**：C++ 逐步 bf16→fp32 累加截断回 bf16，Python `torch.sum` 可能 fp32 中间值 | next_embed 有微小精度差异（<1e-4），对 greedy argmax 通常无影响 | 如需完全对齐，可改为 fp32 累加后截断 |
+| 6 | **Streaming `txt_hidden` 来源**：C++ 从 `all_prefill_hidden[txt_pos]` 取，Python 逻辑由原始模型控制 | Streaming 模式下 talker decode 输入可能不同 | 建议用 non-streaming 模式做 greedy 对齐验证 |
+| 7 | **数值精度**：PyTorch RMSNorm vs C++ `rmsnorm_bf16` 的 bf16↔fp32 截断顺序 | hidden state 有 <1e-4 误差，logits 可能有微小偏差 | 通常 cosine > 0.999 即认为对齐；greedy 下 argmax 通常不受影响 |
+| 8 | **随机数生成器**：Python `np.random.choice` vs C++ `std::mt19937` | Sample 模式下采样结果不同；Greedy 模式无影响 | 不同随机数生成器，给定相同 seed 也无法产生完全相同的采样序列 |
 
 ---
 
-## 六、Greedy 对齐验证步骤（推荐）
+## 六、已修复的差异清单
+
+| 编号 | 差异点 | 修复方案 | 修复文件 |
+|------|--------|----------|----------|
+| **P0** | **Talker Decode Mask 缺少 prefill 可见标记** | 在 `RunTtsWithCpCallback` mask 初始化后添加 `for (int i = 0; i < input_embed_num && i < (int)mask.size(); i++) mask[(size_t)i] = 0;` | `src/runner/LLM_cp_tts_insert.inc:513` |
+| 1 | **Talker Repetition Penalty 公式/窗口不一致** | 移除使用 `sqrt(penalty)` + `penalty_window=20` 的死代码变体；确保唯一路径 `sample_from_logits` 使用 `buf[id] >= 0 ? buf[id] / penalty : buf[id] * penalty`（与 Python `< 0 ? * penalty : / penalty` 等价），作用于全部历史 | `src/runner/LLMPostprocess.hpp` |
+| 2 | **Talker Top-K/Top-P 组合策略不一致** | `sample_from_logits` 已支持 top_k + top_p 顺序组合（top_k → softmax → top_p），`set_top_p_sampling` 不会关闭 `enable_top_k_sampling` | 无需代码修改（已有逻辑对齐） |
+| 3 | **CP 采样参数硬编码** | `RunCpFrame` 中硬编码 `cp_temperature=0.9f, cp_top_k=50, cp_top_p=1.0f` 替换为从 `_attr.cp_temperature`/`_attr.cp_top_k`/`_attr.cp_top_p` 读取；`qwen3_tts_infer.cpp` 新增 `--cp_temperature`/`--cp_top_k`/`--cp_top_p` CLI 参数；`LLMAttrType` 新增对应字段 | `src/runner/LLM_cp_tts_insert.inc`, `src/runner/LLM.hpp`, `tools/qwen3_tts_infer.cpp` |
+
+---
+
+## 七、Greedy 对齐验证步骤（推荐）
 
 要确认两端完全一致，建议关闭所有随机性，用 **greedy + non-streaming** 模式对比：
 
@@ -215,6 +223,7 @@ python scripts/infer.py \
     <talker_dir> ./debug_bin \
     --max_new_tokens 128 \
     --temperature 0.0 \
+    --cp_temperature 0.0 \
     --streaming false
 ```
 

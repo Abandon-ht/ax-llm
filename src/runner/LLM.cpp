@@ -92,6 +92,7 @@ struct LLM::Impl {
     std::vector<int> prefill_grpids_;            // sorted by prefill capacity (ascending), aligns with _attr.prefill_max_kv_cache_num_grp
     std::atomic<bool> b_stop{false};
     LLMPostprocess postprocess;
+    std::mt19937 cp_rng_;
 
     // ---- Qwen3-TTS Code Predictor ----
     std::vector<LLMLayer> cp_layers;
@@ -767,6 +768,13 @@ struct LLM::Impl {
                 ALOGW("load postprocess config(%s) failed", this->_attr.post_config_path.c_str());
             }
         }
+
+        // ---- Init CP RNG ----
+        if (_attr.cp_seed >= 0)
+            cp_rng_.seed(static_cast<unsigned int>(_attr.cp_seed));
+        else
+            cp_rng_.seed(std::random_device{}());
+
         // ---- Init Code Predictor (optional) ----
         if (!_attr.cp_model_dir.empty())
         {
