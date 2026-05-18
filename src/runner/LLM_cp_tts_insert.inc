@@ -593,6 +593,9 @@
                     auto &pre_v_dst = lyr.layer.get_input(prefill_grpid, "V_cache");
                     size_t history_bytes = (size_t)history_len * _attr.kv_cache_size * sizeof(unsigned short);
                     history_bytes = std::min(history_bytes, (size_t)pre_k_dst.nSize);
+                    history_bytes = std::min(history_bytes, (size_t)pre_v_dst.nSize);
+                    history_bytes = std::min(history_bytes, (size_t)dec_k_src.nSize);
+                    history_bytes = std::min(history_bytes, (size_t)dec_v_src.nSize);
                     if (history_bytes > 0) {
                         llm_d2d(LLM_WADDR(pre_k_dst), LLM_RADDR(dec_k_src), history_bytes, devid);
                         llm_d2d(LLM_WADDR(pre_v_dst), LLM_RADDR(dec_v_src), history_bytes, devid);
