@@ -146,7 +146,8 @@ public:
     bool RunCpFrame(const std::vector<unsigned short> &last_hidden_bf16,
                     int primary_code,
                     std::vector<int> &out_frame_codes,
-                    std::vector<unsigned short> &out_codec_sum_bf16);
+                    std::vector<unsigned short> &out_codec_sum_bf16,
+                    int frame_idx = 0);
 
     // CP callback interface for hybrid ablation (e.g. AX Talker + ONNX CP).
     struct TtsCpCallback {
@@ -164,6 +165,12 @@ public:
 
     // Set tts_pad_vec for non-streaming TTS decode (bf16, [hidden_size]).
     void SetTtsPadVec(const std::vector<unsigned short> &tts_pad_vec);
+
+    // Set trailing_text start position in prefill layout (streaming mode).
+    void SetTtsTrailingStart(int start);
+
+    // Set logit suppression range for talker (e.g. suppress [2048, 3072) except EOS).
+    void SetSuppressRange(int begin, int end, int except_token = -1);
 
     // Debug: set directory for dumping intermediate tensors
     void SetDebugDumpDir(const std::string &dir);

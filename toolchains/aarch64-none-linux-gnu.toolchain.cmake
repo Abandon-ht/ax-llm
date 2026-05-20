@@ -3,8 +3,8 @@ SET (CMAKE_SYSTEM_NAME Linux)
 SET (CMAKE_SYSTEM_PROCESSOR aarch64)
 
 # aarch64-linux-gnu-gcc DO NOT need to be installed, so make sure aarch64-linux-gnu-gcc and aarch64-linux-gnu-g++ can be found in $PATH:
-SET (CMAKE_C_COMPILER   "aarch64-linux-gnu-gcc")
-SET (CMAKE_CXX_COMPILER "aarch64-linux-gnu-g++")
+SET (CMAKE_C_COMPILER   "aarch64-none-linux-gnu-gcc")
+SET (CMAKE_CXX_COMPILER "aarch64-none-linux-gnu-g++")
 
 # set searching rules for cross-compiler
 SET (CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)

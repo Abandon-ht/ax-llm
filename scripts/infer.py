@@ -168,10 +168,35 @@ def _fp32_to_bf16_raw(arr: np.ndarray) -> bytes:
     return bf16.tobytes()
 
 
+def _load_bf16_embedding_weight(path: Path, num_embeddings: int, embedding_dim: int) -> np.ndarray:
+    """Load bfloat16 raw embedding weight [num_embeddings, embedding_dim] from file."""
+    raw = path.read_bytes()
+    expected = num_embeddings * embedding_dim * 2
+    if len(raw) != expected:
+        raise ValueError(f"{path}: size mismatch, got {len(raw)}, expected {expected}")
+    u16 = np.frombuffer(raw, dtype=np.uint16).reshape(num_embeddings, embedding_dim)
+    fp32 = (u16.astype(np.uint32) << 16).view(np.float32)
+    return fp32.copy()
+
+
 def _save_prefill_embeds_bin(path: Path, tensor) -> None:
     """Save prefill embeddings as raw bfloat16 [S, hidden_size] without header."""
     path.parent.mkdir(parents=True, exist_ok=True)
     np_arr = tensor.detach().cpu().squeeze(0).float().numpy()  # [S, H] float32
+    path.write_bytes(_fp32_to_bf16_raw(np_arr))
+
+
+def _save_tensor_fp32_bin(path: Path, tensor) -> None:
+    """Save tensor as raw float32 [S, hidden_size] without header."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np_arr = tensor.detach().cpu().squeeze(0).float().numpy()
+    path.write_bytes(np_arr.astype(np.float32).tobytes())
+
+
+def _save_tensor_bf16_bin(path: Path, tensor) -> None:
+    """Save tensor as raw bfloat16 [S, hidden_size] without header."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np_arr = tensor.detach().cpu().squeeze(0).float().numpy()
     path.write_bytes(_fp32_to_bf16_raw(np_arr))
 
 
@@ -195,6 +220,28 @@ def _save_tts_pad_vec_bin(path: Path, vec) -> None:
     with open(path, "wb") as f:
         f.write(struct.pack("i", hidden_size))
         f.write(np_vec.astype(np.float32).tobytes())
+
+
+def _save_output_codes(codes, dump_dir: Path) -> None:
+    """Save generated codes as int32 [num_frames, num_codebooks] raw binary for infer_bin.py."""
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    np_codes = codes.detach().cpu().numpy().astype(np.int32)
+    num_frames, num_codebooks = np_codes.shape
+    bin_path = dump_dir / "output_codes.bin"
+    bin_path.write_bytes(np_codes.tobytes())
+
+    meta_path = dump_dir / "output_meta.json"
+    meta = {
+        "num_frames": int(num_frames),
+        "num_codebooks": int(num_codebooks),
+        "dtype": "int32",
+        "shape": [int(num_frames), int(num_codebooks)],
+    }
+    meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False))
+    print(
+        f"[dump] output_codes.bin ({num_frames}x{num_codebooks}) and output_meta.json saved to {dump_dir}",
+        flush=True,
+    )
 
 
 def _numpy_dtype(dtype: str):
@@ -647,12 +694,46 @@ def _build_axengine_talker_module(
     dump_trailing_start: int = 7,
     dump_audio_token_id: Optional[int] = None,
     dump_streaming: bool = False,
+    codec_embedding_weight_path: Optional[Path] = None,
 ):
     class _AxEngineQwen3TTSTalkerModel(torch_module.nn.Module):
         def __init__(self):
             super().__init__()
             self.config = original_model.config
-            self.codec_embedding = original_model.get_input_embeddings()
+            if codec_embedding_weight_path is not None:
+                print(
+                    f"[talker] loading codec_embedding from file: {codec_embedding_weight_path}",
+                    flush=True,
+                )
+                weight_np = _load_bf16_embedding_weight(
+                    codec_embedding_weight_path,
+                    num_embeddings=int(original_model.config.vocab_size),
+                    embedding_dim=int(original_model.config.hidden_size),
+                )
+                ref_device = (
+                    next(original_model.parameters()).device
+                    if hasattr(original_model, "parameters")
+                    else torch_module.device("cpu")
+                )
+                ref_dtype = (
+                    next(original_model.parameters()).dtype
+                    if hasattr(original_model, "parameters")
+                    else torch_module.float32
+                )
+                self.codec_embedding = torch_module.nn.Embedding(
+                    int(original_model.config.vocab_size),
+                    int(original_model.config.hidden_size),
+                )
+                self.codec_embedding.weight.data = torch_module.from_numpy(weight_np).to(
+                    device=ref_device, dtype=ref_dtype
+                )
+                print(
+                    f"[talker] codec_embedding loaded: shape={self.codec_embedding.weight.shape}, "
+                    f"device={self.codec_embedding.weight.device}, dtype={self.codec_embedding.weight.dtype}",
+                    flush=True,
+                )
+            else:
+                self.codec_embedding = original_model.get_input_embeddings()
             self.text_embedding = original_model.get_text_embeddings()
             self.norm = original_model.norm
             self.gradient_checkpointing = False
@@ -816,6 +897,7 @@ def _build_axengine_talker_module(
                     dump_dir = Path(self._dump_cpp_dir)
                     dump_dir.mkdir(parents=True, exist_ok=True)
                     _save_prefill_embeds_bin(dump_dir / "prefill_embeds.bin", active_embeds)
+                    _save_prefill_embeds_bin(dump_dir / "prefill_embeds_bf16.bin", active_embeds)
                     audio_token_id = self._dump_audio_token_id
                     if audio_token_id is None:
                         audio_token_id = int(getattr(self.config, "tts_bos_token_id", 151672))
@@ -848,9 +930,45 @@ def _build_axengine_talker_module(
 
             self._last_raw_hidden = raw_hidden
             hidden_states = self._to_hidden_tensor(raw_hidden, inputs_embeds.device, inputs_embeds.dtype)
+            if is_prefill and self._dump_cpp_dir is not None:
+                dump_dir = Path(self._dump_cpp_dir)
+                # 全量 normed hidden（供流式 C++ 读取作为 trailing_text）
+                _save_tensor_fp32_bin(dump_dir / "trailing_text_hiddens.bin", hidden_states)
+                _save_tensor_bf16_bin(dump_dir / "trailing_text_hiddens_bf16.bin", hidden_states)
+                # 最后一个 token 的 raw hidden（pre-RMSNorm，与 C++ embed 对齐）
+                last_raw = torch_module.from_numpy(raw_hidden[:, -1:, :].astype(np.float32)).to(
+                    device=inputs_embeds.device, dtype=inputs_embeds.dtype
+                )
+                _save_tensor_fp32_bin(dump_dir / "prefill_last_raw_hidden.bin", last_raw)
+                # 最后一个 token 的 normed hidden（post-RMSNorm，与 C++ all_prefill_hidden[-1] 对齐）
+                last_normed = hidden_states[:, -1:, :]
+                _save_tensor_fp32_bin(dump_dir / "prefill_last_normed_hidden.bin", last_normed)
+                print(f"[dump] prefill hidden states (trailing_text / last_raw / last_normed) saved to {dump_dir}")
+
+            # ---- Debug dump for decode steps ----
+            import os
+            _dump_dir = os.environ.get("QWEN3_TTS_DUMP_DIR")
+            if _dump_dir and not is_prefill:
+                step_dir = Path(_dump_dir) / "python_talker_decode"
+                step_dir.mkdir(parents=True, exist_ok=True)
+                step = self._debug_forward_idx - 1  # prefill consumed idx 0
+                # inputs_embeds (codec_sum + trailing_text / tts_pad)
+                inputs_embeds[:, -1, :].detach().cpu().to(torch_module.float32).numpy().reshape(-1).tofile(
+                    step_dir / f"python_talker_decode_step{step:03d}_inputs_embeds.bin"
+                )
+                # raw hidden (pre-norm)
+                np.array(raw_hidden, dtype=np.float32).reshape(-1).tofile(
+                    step_dir / f"python_talker_decode_step{step:03d}_raw_hidden.bin"
+                )
+                # normed hidden (post-norm)
+                hidden_states[:, -1, :].detach().cpu().to(torch_module.float32).numpy().reshape(-1).tofile(
+                    step_dir / f"python_talker_decode_step{step:03d}_normed_hidden.bin"
+                )
+
+            frame_idx = self._debug_forward_idx
             self._debug_forward_idx += 1
             self._compare_with_hf_reference(
-                frame_idx=self._debug_forward_idx,
+                frame_idx=frame_idx,
                 stage=stage,
                 raw_hidden=raw_hidden,
                 hidden_states=hidden_states,
@@ -881,6 +999,20 @@ def _build_axengine_talker_post_head(torch_module, axengine_talker_model):
             if raw_hidden is None:
                 raise RuntimeError("talker post head was called before axengine talker model forward")
             logits = self.axengine_talker_model.runner.run_post_logits(raw_hidden)
+            # ---- Debug dump: talker logits and next_token ----
+            import os
+            _dump_dir = os.environ.get("QWEN3_TTS_DUMP_DIR")
+            if _dump_dir:
+                step_dir = Path(_dump_dir) / "python_talker_decode"
+                step_dir.mkdir(parents=True, exist_ok=True)
+                step = self.axengine_talker_model._debug_forward_idx - 1
+                np.array(logits, dtype=np.float32).reshape(-1).tofile(
+                    step_dir / f"python_talker_decode_step{step:03d}_logits.bin"
+                )
+                next_token = int(np.argmax(logits))
+                np.array([next_token], dtype=np.int32).tofile(
+                    step_dir / f"python_talker_decode_step{step:03d}_next_token.bin"
+                )
             return torch_module.from_numpy(logits).to(device=hidden_states.device, dtype=torch_module.float32)
 
     return _AxEngineQwen3TTSTalkerPostHead()
@@ -919,6 +1051,7 @@ def replace_talker_model(qwen_wrapper, args, torch_module):
         dump_trailing_start=getattr(args, "dump_trailing_start", 7),
         dump_audio_token_id=getattr(args, "dump_audio_token_id", None),
         dump_streaming=not getattr(args, "non_streaming_mode", False),
+        codec_embedding_weight_path=getattr(args, "talker_codec_embedding_bin", None),
     ).eval()
     talker.model = axengine_talker_model
     talker.codec_head = _build_axengine_talker_post_head(torch_module, axengine_talker_model).eval()
@@ -1200,6 +1333,14 @@ class StaticCodePredictorRunner:
         last_hidden_raw = data[:, valid_len - 1 : valid_len, :].astype(self.m_dtype)
         device = inputs_embeds.device
 
+        # ---- Debug dump setup ----
+        import os
+        _dump_dir = os.environ.get("QWEN3_TTS_DUMP_DIR")
+        cp_dump_dir = None
+        if _dump_dir:
+            cp_dump_dir = Path(_dump_dir) / "python_cp_dump"
+            cp_dump_dir.mkdir(parents=True, exist_ok=True)
+
         for offset in range(num_to_generate):
             lm_step = start_lm_step + offset
             if offset > 0:
@@ -1238,6 +1379,31 @@ class StaticCodePredictorRunner:
             )
             generated_ids.append(int(next_id))
 
+            # ---- Debug dump per step ----
+            if cp_dump_dir is not None:
+                import os
+                frame_idx = int(os.environ.get("QWEN3_TTS_CP_FRAME_IDX", "0"))
+                # pre_norm hidden (before post_norm)
+                last_hidden_raw[:, -1, :].astype(np.float32).reshape(-1).tofile(
+                    cp_dump_dir / f"python_cp_frame_{frame_idx:03d}_hidden_pre_norm_{lm_step:03d}.bin"
+                )
+                hidden_norm[:, -1, :].astype(np.float32).reshape(-1).tofile(
+                    cp_dump_dir / f"python_cp_frame_{frame_idx:03d}_hidden_post_norm_{lm_step:03d}.bin"
+                )
+                logits.astype(np.float32).reshape(-1).tofile(
+                    cp_dump_dir / f"python_cp_frame_{frame_idx:03d}_lm_head_{lm_step:03d}_logits.bin"
+                )
+                np.array([next_id], dtype=np.int32).tofile(
+                    cp_dump_dir / f"python_cp_frame_{frame_idx:03d}_sampled_token_{lm_step:03d}.bin"
+                )
+
+        if cp_dump_dir is not None and generated_ids:
+            import os
+            frame_idx = int(os.environ.get("QWEN3_TTS_CP_FRAME_IDX", "0"))
+            np.array(generated_ids, dtype=np.int32).tofile(
+                cp_dump_dir / f"python_cp_frame_{frame_idx:03d}_generated_ids.bin"
+            )
+
         if return_debug:
             return generated_ids, debug_info
         return generated_ids
@@ -1248,6 +1414,7 @@ def _build_axengine_code_predictor_module(
     original_model,
     runner: StaticCodePredictorRunner,
     compare_frames: int = 0,
+    codec_embedding_bin_dir: Optional[Path] = None,
 ):
     class _AxEngineQwen3TTSTalkerCodePredictorModelForConditionalGeneration(torch_module.nn.Module):
         def __init__(self):
@@ -1255,7 +1422,46 @@ def _build_axengine_code_predictor_module(
             self.config = original_model.config
             self.generation_config = getattr(original_model, "generation_config", None)
             self.vocab_size = int(getattr(original_model, "vocab_size", self.config.vocab_size))
-            self.codec_embedding = original_model.get_input_embeddings()
+            if codec_embedding_bin_dir is not None:
+                print(
+                    f"[code_predictor] loading codec_embedding from files in: {codec_embedding_bin_dir}",
+                    flush=True,
+                )
+                ref_device = (
+                    next(original_model.parameters()).device
+                    if hasattr(original_model, "parameters")
+                    else torch_module.device("cpu")
+                )
+                ref_dtype = (
+                    next(original_model.parameters()).dtype
+                    if hasattr(original_model, "parameters")
+                    else torch_module.float32
+                )
+                embeddings = []
+                for i in range(runner.num_sub_codes):
+                    path = codec_embedding_bin_dir / f"talker.code_predictor.model.codec_embedding.{i}.weight.bfloat16.bin"
+                    weight_np = _load_bf16_embedding_weight(
+                        path,
+                        num_embeddings=int(self.config.vocab_size),
+                        embedding_dim=int(self.config.hidden_size),
+                    )
+                    emb = torch_module.nn.Embedding(
+                        int(self.config.vocab_size),
+                        int(self.config.hidden_size),
+                    )
+                    emb.weight.data = torch_module.from_numpy(weight_np).to(
+                        device=ref_device, dtype=ref_dtype
+                    )
+                    embeddings.append(emb)
+                self.codec_embedding = torch_module.nn.ModuleList(embeddings)
+                print(
+                    f"[code_predictor] codec_embedding loaded: count={len(embeddings)}, "
+                    f"each_shape={embeddings[0].weight.shape}, device={embeddings[0].weight.device}, "
+                    f"dtype={embeddings[0].weight.dtype}",
+                    flush=True,
+                )
+            else:
+                self.codec_embedding = original_model.get_input_embeddings()
             self.small_to_mtp_projection = original_model.small_to_mtp_projection
             self.runner = runner
             self.compare_frames = max(0, int(compare_frames))
@@ -1409,6 +1615,8 @@ def _build_axengine_code_predictor_module(
             # projected_inputs = self.small_to_mtp_projection(inputs_embeds)
             projected_inputs = inputs_embeds
             self._compare_with_hf_reference(frame_idx, inputs_embeds, projected_inputs, max_new_tokens)
+            import os
+            os.environ["QWEN3_TTS_CP_FRAME_IDX"] = str(frame_idx - 1)
             ids = self.runner.generate_from_inputs_embeds(
                 inputs_embeds=projected_inputs,
                 embedding_tables=self.codec_embedding,
@@ -1427,6 +1635,24 @@ def _build_axengine_code_predictor_module(
                     f"[compare][code_predictor][frame={frame_idx}] ax_actual_{mode}={ids}",
                     flush=True,
                 )
+            # ---- Debug dump: codec_sum for talker decode input (L3) ----
+            _dump_dir = os.environ.get("QWEN3_TTS_DUMP_DIR")
+            if _dump_dir and ids:
+                talker_step_dir = Path(_dump_dir) / "python_talker_decode"
+                talker_step_dir.mkdir(parents=True, exist_ok=True)
+                frame_idx_for_dump = frame_idx - 1  # equals talker decode step
+                # primary_embed is the last token of inputs_embeds
+                primary_embed = inputs_embeds[:, -1:, :]  # [B, 1, H]
+                codec_sum = primary_embed.clone()
+                for i, token_id in enumerate(ids):
+                    sub_embed = self.codec_embedding[i](
+                        torch_module.tensor([[token_id]], device=primary_embed.device, dtype=torch_module.long)
+                    )
+                    codec_sum = codec_sum + sub_embed
+                codec_sum[:, -1, :].detach().cpu().to(torch_module.float32).numpy().reshape(-1).tofile(
+                    talker_step_dir / f"python_talker_decode_step{frame_idx_for_dump:03d}_codec_sum.bin"
+                )
+
             sequences = torch_module.tensor([ids], device=inputs_embeds.device, dtype=torch_module.long)
             if return_dict_in_generate:
                 return SimpleNamespace(sequences=sequences)
@@ -1461,6 +1687,7 @@ def replace_code_predictor_model(qwen_wrapper, args, torch_module):
         original_model,
         runner,
         compare_frames=compare_frames,
+        codec_embedding_bin_dir=getattr(args, "code_predictor_codec_embedding_bin_dir", None),
     ).eval()
     if torch_module.cuda.is_available():
         torch_module.cuda.empty_cache()
@@ -1499,6 +1726,7 @@ def _set_seed(seed: int, torch_module):
 
 def _generate_and_save(qwen_wrapper, args, output_path: Path):
     import soundfile as sf
+    import torch
 
     model_type = getattr(qwen_wrapper.model, "tts_model_type", "")
     api = args.api
@@ -1516,15 +1744,18 @@ def _generate_and_save(qwen_wrapper, args, output_path: Path):
         subtalker_top_k=args.subtalker_top_k,
         subtalker_top_p=args.subtalker_top_p,
         subtalker_temperature=args.subtalker_temperature,
+        return_codes=True,
+        skip_decoder=args.skip_wav_generation,
     )
 
+    codes_list = None
     if api == "voice_clone":
         ref_audio = args.ref_audio
         if not ref_audio.exists():
             candidate = args.qwen_tts_root / ref_audio
             if candidate.exists():
                 ref_audio = candidate
-        wavs, sr = qwen_wrapper.generate_voice_clone(
+        result = qwen_wrapper.generate_voice_clone(
             text=args.text,
             language=args.language,
             ref_audio=str(ref_audio),
@@ -1533,20 +1764,29 @@ def _generate_and_save(qwen_wrapper, args, output_path: Path):
             non_streaming_mode=args.non_streaming_mode,
             **generate_kwargs,
         )
+        wavs, sr, codes_list = result
     elif api == "custom_voice":
-        wavs, sr = qwen_wrapper.generate_custom_voice(
+        result = qwen_wrapper.generate_custom_voice(
             text=args.text,
             language=args.language,
             speaker=args.speaker,
             instruct=args.instruct,
             **generate_kwargs,
         )
+        wavs, sr, codes_list = result
     else:
         raise ValueError(f"unsupported api: {api}")
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    sf.write(str(output_path), wavs[0], sr)
-    print(f"[audio] saved {output_path} sr={sr} samples={len(wavs[0])}")
+    if args.dump_output_codes_dir is not None and codes_list is not None:
+        dump_dir = Path(args.dump_output_codes_dir)
+        _save_output_codes(codes_list[0], dump_dir)
+
+    if not args.skip_wav_generation:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        sf.write(str(output_path), wavs[0], sr)
+        print(f"[audio] saved {output_path} sr={sr} samples={len(wavs[0])}")
+    else:
+        print("[skip] WAV generation skipped as requested.", flush=True)
 
 
 def parse_args():
@@ -1556,7 +1796,19 @@ def parse_args():
     parser.add_argument("--qwen_tts_root", type=Path, default=DEFAULT_QWEN_TTS_ROOT)
     parser.add_argument("--hf_model_path", type=Path, default=DEFAULT_HF_MODEL_PATH)
     parser.add_argument("--talker_compiled_model_path", type=Path, default=DEFAULT_TALKER_AXMODEL_DIR)
+    parser.add_argument(
+        "--talker_codec_embedding_bin",
+        type=Path,
+        default=Path("/home/m5stack/rsp/Qwen3-TTS-12Hz-0.6B-Base-AX650/talker/talker.model.codec_embedding.weight.bfloat16.bin"),
+        help="Path to talker codec_embedding weight bfloat16 bin. If provided, load from file instead of HF model.",
+    )
     parser.add_argument("--code_predictor_compiled_model_path", type=Path, default=DEFAULT_CODE_PREDICTOR_AXMODEL_DIR)
+    parser.add_argument(
+        "--code_predictor_codec_embedding_bin_dir",
+        type=Path,
+        default=Path("/home/m5stack/rsp/Qwen3-TTS-12Hz-0.6B-Base-AX650/code-predictor"),
+        help="Directory containing code_predictor codec_embedding weight bfloat16 bin files. If provided, load from files instead of HF model.",
+    )
     parser.add_argument(
         "--code_predictor_lm_head_onnx_dir",
         type=Path,
@@ -1623,6 +1875,10 @@ def parse_args():
                         help="trailing_start value written to meta.json (default: 7)")
     parser.add_argument("--dump_audio_token_id", type=int, default=None,
                         help="audio_token_id written to meta.json (default: config.tts_bos_token_id)")
+    parser.add_argument("--skip_wav_generation", action="store_true",
+                        help="Skip torch decoder WAV generation (use ONNX decoder via infer_bin.py instead).")
+    parser.add_argument("--dump_output_codes_dir", type=Path, default=None,
+                        help="Directory to dump output_codes.bin and output_meta.json for infer_bin.py.")
     return parser.parse_args()
 
 
@@ -1641,6 +1897,10 @@ def _replace_args(args, compiled_model_path: Path, prefill_len: int, model_type:
         dump_trailing_start=getattr(args, "dump_trailing_start", 7),
         dump_audio_token_id=getattr(args, "dump_audio_token_id", None),
         non_streaming_mode=getattr(args, "non_streaming_mode", False),
+        skip_wav_generation=getattr(args, "skip_wav_generation", False),
+        dump_output_codes_dir=getattr(args, "dump_output_codes_dir", None),
+        talker_codec_embedding_bin=getattr(args, "talker_codec_embedding_bin", None),
+        code_predictor_codec_embedding_bin_dir=getattr(args, "code_predictor_codec_embedding_bin_dir", None),
     )
 
 
@@ -1677,15 +1937,17 @@ def main():
             talker = qwen.model.talker
             tts_pad_token_id = getattr(qwen.model.config, "tts_pad_token_id", 151671)
             with torch.no_grad():
-                tts_pad_embed = talker.model.text_projection(
-                    talker.model.get_text_embeddings()(
+                tts_pad_embed = talker.text_projection(
+                    talker.get_text_embeddings()(
                         torch.tensor([[tts_pad_token_id]], device=talker.model.device, dtype=torch.long)
                     )
                 )
             _save_tts_pad_vec_bin(dump_dir / "tts_pad_vec.bin", tts_pad_embed)
-            print(f"[dump] tts_pad_vec.bin saved to {dump_dir}")
+            np_pad_vec = tts_pad_embed.detach().cpu().squeeze().float().numpy()
+            dump_dir.joinpath("tts_pad_vec_bf16.bin").write_bytes(_fp32_to_bf16_raw(np_pad_vec))
+            print(f"[dump] tts_pad_vec.bin / tts_pad_vec_bf16.bin saved to {dump_dir}")
         except Exception as exc:
-            print(f"[dump] warning: failed to save tts_pad_vec.bin: {exc}")
+            print(f"[dump] warning: failed to save tts_pad_vec.bin / tts_pad_vec_bf16.bin: {exc}")
 
     if args.save_hf_reference:
         _set_seed(args.seed, torch)

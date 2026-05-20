@@ -4,7 +4,8 @@
  * Qwen3-TTS AX650 推理工具（纯 AXModel）
  *
  * 主要参考 infer.py 的推理逻辑：
- *   - 支持完整的采样参数（temperature / top_k / top_p / repetition_penalty）
+ *   - 采样参数（temperature / top_k / top_p / repetition_penalty）
+ *     完全由 model_dir/post_config.json 控制，不接受 CLI 覆盖
  *   - 支持流式 / 非流式模式
  *   - 支持设置随机种子
  *
@@ -18,13 +19,6 @@
  *
  * Options:
  *   --max_new_tokens <N>       最大生成帧数（默认 128）
- *   --temperature <float>      采样温度（默认 0.9）
- *   --top_k <int>              top-k 采样（默认 50）
- *   --top_p <float>            top-p 采样（默认 1.0）
- *   --repetition_penalty <f>   重复惩罚（默认 1.05）
- *   --cp_temperature <float>    CP 采样温度（默认 0.9）
- *   --cp_top_k <int>            CP top-k（默认 50）
- *   --cp_top_p <float>          CP top-p（默认 1.0）
  *   --streaming                启用流式模式
  *   --codec_eos_token_id <id>  EOS token ID（默认 2150）
  *   --output <prefix>          输出文件前缀（默认 <npy_dir>/output）
@@ -148,17 +142,11 @@ struct Args
     std::string model_dir;
     std::string npy_dir;
     int max_new_tokens = 128;
-    float temperature = 0.9f;
-    int top_k = 50;
-    float top_p = 1.0f;
-    float repetition_penalty = 1.05f;
-    float cp_temperature = 0.9f;
-    int cp_top_k = 50;
-    float cp_top_p = 1.0f;
     bool streaming = false;
     int codec_eos_token_id = 2150;
     std::string output_prefix;
     int seed = -1;
+    std::string debug_dump_dir;
 };
 
 static void print_usage(const char *prog)
@@ -171,17 +159,13 @@ static void print_usage(const char *prog)
         "\n"
         "Options:\n"
         "  --max_new_tokens <N>       Max frames to generate (default: 128)\n"
-        "  --temperature <float>      Sampling temperature (default: 0.9)\n"
-        "  --top_k <int>              Top-k sampling (default: 50)\n"
-        "  --top_p <float>            Top-p sampling (default: 1.0)\n"
-        "  --repetition_penalty <f>   Repetition penalty (default: 1.05)\n"
-        "  --cp_temperature <float>  CP (subtalker) sampling temperature (default: 0.9)\n"
-        "  --cp_top_k <int>          CP top-k sampling (default: 50)\n"
-        "  --cp_top_p <float>        CP top-p sampling (default: 1.0)\n"
         "  --streaming                Enable streaming mode\n"
         "  --codec_eos_token_id <id>  Codec EOS token id (default: 2150)\n"
         "  --output <prefix>          Output file prefix (default: <npy_dir>/output)\n"
         "  --seed <int>               Random seed (default: not set)\n"
+        "\n"
+        "Sampling params (temperature/top_k/top_p/repetition_penalty) are loaded\n"
+        "from post_config.json in model_dir. CLI override is NOT supported.\n"
         "\n"
         "npy_dir must contain:\n"
         "  prefill_embeds.bin   bfloat16 [S, hidden_size]\n"
@@ -206,34 +190,6 @@ static bool parse_args(int argc, char **argv, Args &args)
         {
             args.max_new_tokens = std::atoi(argv[++i]);
         }
-        else if (strcmp(argv[i], "--temperature") == 0 && i + 1 < argc)
-        {
-            args.temperature = std::atof(argv[++i]);
-        }
-        else if (strcmp(argv[i], "--top_k") == 0 && i + 1 < argc)
-        {
-            args.top_k = std::atoi(argv[++i]);
-        }
-        else if (strcmp(argv[i], "--top_p") == 0 && i + 1 < argc)
-        {
-            args.top_p = std::atof(argv[++i]);
-        }
-        else if (strcmp(argv[i], "--repetition_penalty") == 0 && i + 1 < argc)
-        {
-            args.repetition_penalty = std::atof(argv[++i]);
-        }
-        else if (strcmp(argv[i], "--cp_temperature") == 0 && i + 1 < argc)
-        {
-            args.cp_temperature = std::atof(argv[++i]);
-        }
-        else if (strcmp(argv[i], "--cp_top_k") == 0 && i + 1 < argc)
-        {
-            args.cp_top_k = std::atoi(argv[++i]);
-        }
-        else if (strcmp(argv[i], "--cp_top_p") == 0 && i + 1 < argc)
-        {
-            args.cp_top_p = std::atof(argv[++i]);
-        }
         else if (strcmp(argv[i], "--streaming") == 0)
         {
             args.streaming = true;
@@ -249,6 +205,10 @@ static bool parse_args(int argc, char **argv, Args &args)
         else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc)
         {
             args.seed = std::atoi(argv[++i]);
+        }
+        else if (strcmp(argv[i], "--debug-dump-dir") == 0 && i + 1 < argc)
+        {
+            args.debug_dump_dir = argv[++i];
         }
         else
         {
@@ -280,18 +240,13 @@ int main(int argc, char **argv)
     printf("model_dir            : %s\n", args.model_dir.c_str());
     printf("npy_dir              : %s\n", args.npy_dir.c_str());
     printf("max_new_tokens       : %d\n", args.max_new_tokens);
-    printf("temperature          : %.2f\n", args.temperature);
-    printf("top_k                : %d\n", args.top_k);
-    printf("top_p                : %.2f\n", args.top_p);
-    printf("repetition_penalty   : %.2f\n", args.repetition_penalty);
-    printf("cp_temperature       : %.2f\n", args.cp_temperature);
-    printf("cp_top_k             : %d\n", args.cp_top_k);
-    printf("cp_top_p             : %.2f\n", args.cp_top_p);
     printf("streaming            : %s\n", args.streaming ? "true" : "false");
     printf("codec_eos_token_id   : %d\n", args.codec_eos_token_id);
     printf("output_prefix        : %s\n", args.output_prefix.c_str());
     if (args.seed >= 0)
         printf("seed                 : %d\n", args.seed);
+    if (!args.debug_dump_dir.empty())
+        printf("debug_dump_dir       : %s\n", args.debug_dump_dir.c_str());
 
     // ── 0. 读取 meta.json ──────────────────────────────────────────────────
     const std::string meta_path = args.npy_dir + "/meta.json";
@@ -402,9 +357,6 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    attr.cp_temperature = args.cp_temperature;
-    attr.cp_top_k = args.cp_top_k;
-    attr.cp_top_p = args.cp_top_p;
     attr.cp_seed = args.seed;
 
     // 推断 code-predictor 目录
@@ -434,20 +386,22 @@ int main(int argc, char **argv)
     }
     printf("[INFO] LLM initialized OK\n\n");
 
-    // ── 4. 设置采样参数（仅在 CLI 显式指定或值与“关闭状态”不同时覆盖 post_config.json）─
+    if (!args.debug_dump_dir.empty())
+    {
+        llm.SetDebugDumpDir(args.debug_dump_dir);
+        printf("[INFO] SetDebugDumpDir = %s\n", args.debug_dump_dir.c_str());
+    }
+
+    // ── 4. 随机种子（采样参数由 post_config.json 控制，CLI 不覆盖）─
     LLMPostprocess *postprocess = llm.getPostprocess();
     if (postprocess)
     {
-        postprocess->set_temperature(args.temperature != 1.0f, args.temperature);
-        postprocess->set_top_k_sampling(args.top_k > 0, args.top_k);
-        postprocess->set_top_p_sampling(args.top_p > 0.0f && args.top_p < 1.0f, args.top_p);
-        postprocess->set_repetition_penalty(args.repetition_penalty != 1.0f, args.repetition_penalty);
         if (args.seed >= 0)
         {
             postprocess->set_seed(args.seed);
             printf("[INFO] Set random seed to %d\n", args.seed);
         }
-        printf("[INFO] Postprocess config set according to CLI / generation_config defaults\n");
+        printf("[INFO] Postprocess config loaded from %s\n", attr.post_config_path.c_str());
     }
     else
     {
@@ -460,6 +414,21 @@ int main(int argc, char **argv)
     {
         llm.SetTtsPadVec(tts_pad_vec_bf16);
         printf("[INFO] SetTtsPadVec called for non-streaming mode\n");
+    }
+
+    // 设置 trailing_start（来自 meta.json，非流式模式也可用但实际不使用）
+    llm.SetTtsTrailingStart(trailing_start);
+    printf("[INFO] SetTtsTrailingStart = %d\n", trailing_start);
+
+    // 设置 talker logits suppress range，对齐 Python suppress_tokens 逻辑
+    // Python: suppress [vocab_size-1024, vocab_size) except codec_eos_token_id
+    {
+        const int vocab_size = attr.tokens_embed_num;  // 3072
+        const int suppress_begin = vocab_size - 1024;   // 2048
+        const int suppress_end = vocab_size;            // 3072
+        llm.SetSuppressRange(suppress_begin, suppress_end, args.codec_eos_token_id);
+        printf("[INFO] SetSuppressRange = [%d, %d) except %d\n",
+               suppress_begin, suppress_end, args.codec_eos_token_id);
     }
 
     // ── 6. 运行 TTS decode ─────────────────────────────────────────────────
@@ -508,13 +477,6 @@ int main(int argc, char **argv)
             j["codec_eos_token_id"] = args.codec_eos_token_id;
             j["streaming"] = args.streaming;
             j["max_new_tokens"] = args.max_new_tokens;
-            j["temperature"] = args.temperature;
-            j["top_k"] = args.top_k;
-            j["top_p"] = args.top_p;
-            j["repetition_penalty"] = args.repetition_penalty;
-            j["cp_temperature"] = args.cp_temperature;
-            j["cp_top_k"] = args.cp_top_k;
-            j["cp_top_p"] = args.cp_top_p;
             j["seed"] = args.seed;
             std::ofstream ofs(out_meta);
             ofs << j.dump(2);

@@ -188,6 +188,35 @@
             }
         }
 
+        if (!_attr.post_config_path.empty() && std::filesystem::exists(_attr.post_config_path))
+        {
+            try
+            {
+                std::ifstream f(_attr.post_config_path);
+                nlohmann::json j;
+                f >> j;
+                if (j.contains("temperature"))
+                    _attr.cp_temperature = j["temperature"].get<float>();
+                if (j.contains("top_k"))
+                    _attr.cp_top_k = j["top_k"].get<int>();
+                if (j.contains("top_p"))
+                    _attr.cp_top_p = j["top_p"].get<float>();
+                if (j.contains("enable_temperature") && !j["enable_temperature"].get<bool>())
+                    _attr.cp_temperature = 0.0f;
+                ALOGI("CP sampling loaded from %s: temperature=%.3f top_k=%d top_p=%.3f",
+                      _attr.post_config_path.c_str(), _attr.cp_temperature, _attr.cp_top_k, _attr.cp_top_p);
+            }
+            catch (const std::exception &e)
+            {
+                ALOGW("Failed to load CP sampling from %s: %s", _attr.post_config_path.c_str(), e.what());
+            }
+        }
+        else
+        {
+            ALOGW("CP sampling: post_config.json not found, using defaults (temperature=%.3f top_k=%d top_p=%.3f)",
+                  _attr.cp_temperature, _attr.cp_top_k, _attr.cp_top_p);
+        }
+
         cp_loaded = true;
         return true;
     }
@@ -291,7 +320,8 @@
     bool RunCpFrame(const std::vector<unsigned short> &last_hidden_bf16,
                     int primary_code,
                     std::vector<int> &out_frame_codes,
-                    std::vector<unsigned short> &out_codec_sum_bf16)
+                    std::vector<unsigned short> &out_codec_sum_bf16,
+                    int frame_idx = 0)
     {
         if (!cp_loaded) return false;
         const int D = _attr.tokens_embed_size; // 1024
@@ -325,9 +355,18 @@
         std::vector<unsigned int> idx_tmp((size_t)cp_prefill_token_num, 0);
         std::vector<unsigned short> embed_tmp((size_t)cp_prefill_token_num * D, 0);
 
-        const float cp_temperature = _attr.cp_temperature;
+        const float cp_temperature = 0.0f; // Force greedy for alignment validation
         const int cp_top_k = _attr.cp_top_k;
         const float cp_top_p = _attr.cp_top_p;
+
+        // ---- Debug dump setup for CP validation (L2) ----
+        const bool cp_dump_enabled = !debug_dump_dir_.empty();
+        std::string cp_dump_dir;
+        if (cp_dump_enabled) {
+            cp_dump_dir = debug_dump_dir_.back() == '/' ? debug_dump_dir_ : debug_dump_dir_ + "/";
+            cp_dump_dir += "cpp_cp_dump/";
+            std::filesystem::create_directories(cp_dump_dir);
+        }
 
         for (int j = 0; j < 15; ++j)
         {
@@ -374,6 +413,18 @@
                 memcpy(embed_tmp.data(), cp_ctx.data(), (size_t)seq_len * D * sizeof(unsigned short));
             } else {
                 memcpy(embed_tmp.data(), cp_ctx.data() + (cp_ctx.size() - D), D * sizeof(unsigned short));
+            }
+
+            // ---- Debug dump: CP prefill input embeds (L2-1) ----
+            if (cp_dump_enabled && is_prefill) {
+                std::string path = cp_dump_dir + "cpp_cp_frame_" + std::to_string(frame_idx) + "_input_embeds.bin";
+                FILE *fp = fopen(path.c_str(), "wb");
+                if (fp) {
+                    std::vector<float> buf(seq_len * D);
+                    for (int i = 0; i < seq_len * D; ++i) buf[i] = bfloat16(embed_tmp[i]).fp32();
+                    fwrite(buf.data(), sizeof(float), buf.size(), fp);
+                    fclose(fp);
+                }
             }
 
             // run CP 5 layers
@@ -442,6 +493,20 @@
             std::vector<unsigned short> hidden_step(D);
             memcpy(hidden_step.data(), embed_tmp.data() + (seq_len - 1) * D, D * sizeof(unsigned short));
 
+            // ---- Debug dump: CP hidden pre-norm (L2-2) ----
+            if (cp_dump_enabled) {
+                char path[1024];
+                snprintf(path, sizeof(path), "%s/cpp_cp_frame_%03d_hidden_pre_norm_%03d.bin",
+                         cp_dump_dir.c_str(), frame_idx, j);
+                FILE *fp = fopen(path, "wb");
+                if (fp) {
+                    std::vector<float> buf(D);
+                    for (int d = 0; d < D; ++d) buf[d] = bfloat16(hidden_step[d]).fp32();
+                    fwrite(buf.data(), sizeof(float), D, fp);
+                    fclose(fp);
+                }
+            }
+
             // run CP post
             {
                 auto &t_in = cp_post.get_input("input");
@@ -458,12 +523,29 @@
                 }
             }
 
+            // ---- Debug dump: CP hidden post-norm (L2-3) ----
+            if (cp_dump_enabled) {
+                char path[1024];
+                snprintf(path, sizeof(path), "%s/cpp_cp_frame_%03d_hidden_post_norm_%03d.bin",
+                         cp_dump_dir.c_str(), frame_idx, j);
+                FILE *fp = fopen(path, "wb");
+                if (fp) {
+                    std::vector<float> buf(D);
+                    for (int d = 0; d < D; ++d) buf[d] = bfloat16(hidden_step[d]).fp32();
+                    fwrite(buf.data(), sizeof(float), D, fp);
+                    fclose(fp);
+                }
+            }
+
             // run lm_head_j -> logits [2048]
             auto &lmh = cp_lm_heads[j];
             {
                 auto &t_in = lmh.get_input("input");
-                size_t in_copy = std::min((size_t)t_in.nSize, hidden_step.size() * sizeof(unsigned short));
-                llm_h2d(LLM_WADDR(t_in), hidden_step.data(), in_copy, lmh.get_devid());
+                // lm_head expects float32 input, convert bf16 -> fp32
+                std::vector<float> hidden_fp32(D);
+                for (int d = 0; d < D; ++d) hidden_fp32[d] = bfloat16(hidden_step[d]).fp32();
+                size_t in_copy = std::min((size_t)t_in.nSize, hidden_fp32.size() * sizeof(float));
+                llm_h2d(LLM_WADDR(t_in), hidden_fp32.data(), in_copy, lmh.get_devid());
                 lmh.inference();
                 auto &t_out = lmh.get_output("output");
                 int logits_n = (int)(t_out.nSize / sizeof(float));
@@ -475,8 +557,29 @@
                 for (int i = 0; i < logits_n; ++i) {
                     if (logits_fp32[i] > max_logit) { max_logit = logits_fp32[i]; max_idx = i; }
                 }
-                int res_code = CpSampleFromLogits(logits_fp32, cp_temperature, cp_top_k, cp_top_p);
+                // DEBUG: force greedy to align with Python subtalker_dosample=False
+                int res_code = CpSampleFromLogits(logits_fp32, 0.0f, 0, 1.0f);
                 out_frame_codes[j + 1] = res_code;
+
+                // ---- Debug dump: CP lm_head logits and sampled token (L2-4, L2-5) ----
+                if (cp_dump_enabled) {
+                    char path[1024];
+                    snprintf(path, sizeof(path), "%s/cpp_cp_frame_%03d_lm_head_%03d_logits.bin",
+                             cp_dump_dir.c_str(), frame_idx, j);
+                    FILE *fp = fopen(path, "wb");
+                    if (fp) {
+                        fwrite(logits_fp32.data(), sizeof(float), logits_n, fp);
+                        fclose(fp);
+                    }
+                    snprintf(path, sizeof(path), "%s/cpp_cp_frame_%03d_sampled_token_%03d.bin",
+                             cp_dump_dir.c_str(), frame_idx, j);
+                    fp = fopen(path, "wb");
+                    if (fp) {
+                        int32_t tok = res_code;
+                        fwrite(&tok, sizeof(int32_t), 1, fp);
+                        fclose(fp);
+                    }
+                }
 
                 // lookup residual embed
                 std::vector<unsigned short> res_embed(D);
@@ -496,6 +599,20 @@
 
         // Convert fp32 codec_sum back to bf16 (single truncation, matching Python torch.sum)
         for (int d = 0; d < D; ++d) out_codec_sum_bf16[d] = bfloat16(codec_sum_fp32[d]).data;
+
+        // ---- Debug dump: CP codec_sum for this frame (L2-6) ----
+        if (cp_dump_enabled) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/cpp_cp_frame_%03d_codec_sum.bin",
+                     cp_dump_dir.c_str(), frame_idx);
+            FILE *fp = fopen(path, "wb");
+            if (fp) {
+                std::vector<float> buf(D);
+                for (int d = 0; d < D; ++d) buf[d] = bfloat16(out_codec_sum_bf16[d]).fp32();
+                fwrite(buf.data(), sizeof(float), D, fp);
+                fclose(fp);
+            }
+        }
 
         return true;
     }
@@ -736,7 +853,7 @@
         if (!debug_dump_dir_.empty())
         {
             std::string dir = debug_dump_dir_.back() == '/' ? debug_dump_dir_ : debug_dump_dir_ + "/";
-            // Save last hidden state (last token of prefill) as FP32
+            // Save last raw hidden state (pre-RMSNorm, align with Python prefill_last_raw_hidden.bin)
             {
                 std::string path = dir + "debug_talker_prefill_last_hidden_ax.bin";
                 FILE *fp = fopen(path.c_str(), "wb");
@@ -745,7 +862,22 @@
                     for (int d = 0; d < _attr.tokens_embed_size; ++d) buf[d] = bfloat16(embed[d]).fp32();
                     fwrite(buf.data(), sizeof(float), buf.size(), fp);
                     fclose(fp);
-                    ALOGI("[DEBUG] Saved AX prefill last_hidden -> %s", path.c_str());
+                    ALOGI("[DEBUG] Saved AX prefill last_raw_hidden -> %s", path.c_str());
+                }
+            }
+            // Save last normed hidden state (post-RMSNorm, align with Python prefill_last_normed_hidden.bin)
+            {
+                std::string path = dir + "prefill_last_normed_hidden_ax.bin";
+                FILE *fp = fopen(path.c_str(), "wb");
+                if (fp) {
+                    std::vector<float> buf(_attr.tokens_embed_size);
+                    int last_idx = input_embed_num - 1;
+                    for (int d = 0; d < _attr.tokens_embed_size; ++d) {
+                        buf[d] = bfloat16(all_prefill_hidden[(size_t)last_idx * _attr.tokens_embed_size + d]).fp32();
+                    }
+                    fwrite(buf.data(), sizeof(float), buf.size(), fp);
+                    fclose(fp);
+                    ALOGI("[DEBUG] Saved AX prefill last_normed_hidden -> %s", path.c_str());
                 }
             }
             // Save prefill logits (post_out of last token) as FP32
@@ -765,7 +897,6 @@
         }
 
         // ---- Decode loop with CP ----
-        int trailing_start = 7; // text[0] position in 85-token prefill layout
         int step = 0;
         timer t_cost; t_cost.start();
         unsigned int decode_start = (unsigned int)input_embed_num;
@@ -859,7 +990,7 @@
             if (cp_callback) {
                 cp_ok = cp_callback->OnCpFrame(txt_hidden_bf16, primary_code, frame_codes, codec_sum_bf16);
             } else {
-                cp_ok = RunCpFrame(txt_hidden_bf16, primary_code, frame_codes, codec_sum_bf16);
+                cp_ok = RunCpFrame(txt_hidden_bf16, primary_code, frame_codes, codec_sum_bf16, step);
             }
             if (!cp_ok)
             {
@@ -878,7 +1009,7 @@
             // 2. construct next_embed = codec_sum + txt_hidden[step]
             std::vector<unsigned short> next_embed(_attr.tokens_embed_size, 0);            if (streaming)
             {
-                int txt_pos = trailing_start + step;
+                int txt_pos = tts_trailing_start_ + step;
                 if (txt_pos < input_embed_num)
                 {
                     for (int d = 0; d < _attr.tokens_embed_size; ++d)
@@ -912,6 +1043,24 @@
             if (step < 2) {
                 diag_bf16_stats("tts_pad_vec  ", step, tts_pad_vec_bf16.data(), _attr.tokens_embed_size);
                 diag_bf16_stats("next_embed   ", step, next_embed.data(), _attr.tokens_embed_size);
+            }
+
+            // ---- Debug dump: Talker decode inputs (L3-1 ~ L3-3) ----
+            if (!debug_dump_dir_.empty()) {
+                std::string dir = debug_dump_dir_.back() == '/' ? debug_dump_dir_ : debug_dump_dir_ + "/";
+                char path[1024];
+                auto dump_fp32 = [&](const char *name, const std::vector<unsigned short> &vec) {
+                    snprintf(path, sizeof(path), "%scpp_talker_decode_step%03d_%s.bin", dir.c_str(), step, name);
+                    FILE *fp = fopen(path, "wb");
+                    if (fp) {
+                        std::vector<float> buf(vec.size());
+                        for (size_t i = 0; i < vec.size(); ++i) buf[i] = bfloat16(vec[i]).fp32();
+                        fwrite(buf.data(), sizeof(float), buf.size(), fp);
+                        fclose(fp);
+                    }
+                };
+                dump_fp32("codec_sum", codec_sum_bf16);
+                dump_fp32("inputs_embeds", next_embed);
             }
 
             // 3. Talker decode step
@@ -1031,6 +1180,44 @@
             llama_post.inference(); auto &t_out = llama_post.get_output("output");
             unsigned short *post_out = (unsigned short *)t_out.pVirAddr; next_token = post_process(postprocess, post_out, _attr.tokens_embed_num, token_ids, nullptr);
 #endif
+
+            // ---- Debug dump: Talker decode outputs (L3-4 ~ L3-6) ----
+            if (!debug_dump_dir_.empty()) {
+                std::string dir = debug_dump_dir_.back() == '/' ? debug_dump_dir_ : debug_dump_dir_ + "/";
+                char path[1024];
+                // raw hidden
+                snprintf(path, sizeof(path), "%scpp_talker_decode_step%03d_raw_hidden.bin", dir.c_str(), step);
+                FILE *fp = fopen(path, "wb");
+                if (fp) {
+                    std::vector<float> buf(_attr.tokens_embed_size);
+                    for (int d = 0; d < _attr.tokens_embed_size; ++d) buf[d] = bfloat16(embed[d]).fp32();
+                    fwrite(buf.data(), sizeof(float), buf.size(), fp);
+                    fclose(fp);
+                }
+                // logits from post head
+                {
+                    auto &t_out = llama_post.get_output("output");
+                    unsigned short *post_ptr = (unsigned short *)t_out.pVirAddr;
+                    int logits_n = (int)(t_out.nSize / sizeof(unsigned short));
+                    if (logits_n > _attr.tokens_embed_num) logits_n = _attr.tokens_embed_num;
+                    snprintf(path, sizeof(path), "%scpp_talker_decode_step%03d_logits.bin", dir.c_str(), step);
+                    fp = fopen(path, "wb");
+                    if (fp) {
+                        std::vector<float> buf(logits_n);
+                        for (int i = 0; i < logits_n; ++i) buf[i] = bfloat16(post_ptr[i]).fp32();
+                        fwrite(buf.data(), sizeof(float), buf.size(), fp);
+                        fclose(fp);
+                    }
+                }
+                // next token
+                snprintf(path, sizeof(path), "%scpp_talker_decode_step%03d_next_token.bin", dir.c_str(), step);
+                fp = fopen(path, "wb");
+                if (fp) {
+                    int32_t tok = next_token;
+                    fwrite(&tok, sizeof(int32_t), 1, fp);
+                    fclose(fp);
+                }
+            }
 
             if (indices < mask.size()) mask[indices] = 0;
             token_ids.push_back(next_token);

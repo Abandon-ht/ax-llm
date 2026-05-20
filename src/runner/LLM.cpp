@@ -113,6 +113,9 @@ struct LLM::Impl {
     // TTS non-streaming pad vector (bf16, [hidden_size])
     std::vector<unsigned short> tts_pad_vec_bf16;
 
+    // TTS trailing text start position in prefill (default = 7)
+    int tts_trailing_start_ = 7;
+
     // Talker post-norm gamma for CP input (fp32, [hidden_size])
     std::vector<float> cp_norm_gamma;
 
@@ -1652,6 +1655,14 @@ void LLM::SetTtsPadVec(const std::vector<unsigned short> &tts_pad_vec) {
     impl_->tts_pad_vec_bf16 = tts_pad_vec;
 }
 
+void LLM::SetTtsTrailingStart(int start) {
+    impl_->tts_trailing_start_ = start;
+}
+
+void LLM::SetSuppressRange(int begin, int end, int except_token) {
+    impl_->postprocess.set_suppress_range(begin, end, except_token);
+}
+
 void LLM::SetDebugDumpDir(const std::string &dir) { impl_->SetDebugDumpDir(dir); }
 
 bool LLM::RunTts(std::vector<unsigned short> &prefill_embeds, int max_new_tokens, int codec_eos_token_id, TtsDecodeResult &result, bool streaming)
@@ -1662,9 +1673,10 @@ bool LLM::RunTts(std::vector<unsigned short> &prefill_embeds, int max_new_tokens
 bool LLM::RunCpFrame(const std::vector<unsigned short> &last_hidden_bf16,
                      int primary_code,
                      std::vector<int> &out_frame_codes,
-                     std::vector<unsigned short> &out_codec_sum_bf16)
+                     std::vector<unsigned short> &out_codec_sum_bf16,
+                     int frame_idx)
 {
-    return impl_->RunCpFrame(last_hidden_bf16, primary_code, out_frame_codes, out_codec_sum_bf16);
+    return impl_->RunCpFrame(last_hidden_bf16, primary_code, out_frame_codes, out_codec_sum_bf16, frame_idx);
 }
 
 bool LLM::RunTtsWithCpCallback(std::vector<unsigned short> &prefill_embeds,

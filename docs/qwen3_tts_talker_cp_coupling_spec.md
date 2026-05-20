@@ -3,7 +3,9 @@
 > **版本**: v1.0  
 > **目的**: 为 C++ 侧实现 Talker + Code Predictor (CP) 的端到端耦合推理提供精确的逻辑规范。  
 > **依据**:  
-> - `Qwen3-TTS/qwen_tts/core/models/modeling_qwen3_tts.py` (原始 PyTorch 模型)  
+> - `/home/m5stack/Workspace/Qwen3-TTS/qwen_tts/core/models/modeling_qwen3_tts.py` (原始 PyTorch 模型)  
+> - `/home/m5stack/rsp/Qwen3-TTS-12Hz-0.6B-Base` (原始权重)
+> - `/home/m5stack/rsp/Qwen3-TTS-12Hz-0.6B-Base-AX650` (AXMODEL模型)
 > - `scripts/infer.py` (AXEngine Python 替换推理)  
 > - `src/runner/LLM_cp_tts_insert.inc` / `src/runner/LLM.cpp` (现有 C++ 实现参考)
 

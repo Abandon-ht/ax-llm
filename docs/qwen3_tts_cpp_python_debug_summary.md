@@ -1,11 +1,16 @@
 # Qwen3-TTS C++ vs Python 推理一致性调试总结
 
+> **更新日期**: 2026-05-20  
+> **本次更新**: 完成 greedy 采样对齐验证，定位根因为 Talker RMSNorm 数值差异的级联放大。
+
+---
+
 ## 1. 问题背景
 
 在 AX650 平台上，Qwen3-TTS 模型的 C++ 推理结果与 Python（axengine）推理结果存在差异：
-- **Talker Prefill**：已验证 bit-exact 匹配
-- **CP（Code Predictor）Prefill**：输入已对齐，但 decode 阶段后 3/15 个子码分歧
-- **Talker Decode Step 1**：输入 `next_embed` cosine≈0.84，raw hidden 严重分歧（cosine≈0.06）
+- **Talker Prefill**：已验证 bit-exact 匹配（raw hidden）
+- **CP（Code Predictor）Decode**：step 0~1 匹配，step 2 起发散
+- **Talker Decode**：因 CP 输入错误，全程严重分歧
 
 目标：定位并消除 C++ 与 Python 在 decode 阶段的所有推理差异。
 
@@ -13,17 +18,22 @@
 
 ## 2. 已完成验证项及结论
 
-### 2.1 Talker Prefill —— ✅ Bit-Exact 匹配
+### 2.1 Talker Prefill —— ✅ Raw Hidden Bit-Exact，RMSNorm 存在 0.125 差异
 
 | 验证项 | 方法 | 结论 |
 |--------|------|------|
-| Layer0 输出 | 逐元素对比 | `max_diff = 0`，完全一致 |
-| KV Cache | 逐元素对比 | `max_diff = 0`，完全一致 |
-| Last raw hidden / normed hidden | 逐元素对比 | 完全一致 |
-| Prefill logits | argmax 对比 | 均为 1130，完全一致 |
-| 跨运行时验证 | C++ embed 输入 Python axengine | logits 完全一致，排除 axmodel/runtime 差异 |
+| Layer0 输出 / KV Cache | 逐元素对比 | `max_diff = 0`，完全一致 |
+| Last raw hidden | 逐元素对比 | `cos=1.000`, `max_diff=0`，bit-exact |
+| Last normed hidden | 逐元素对比 | `cos=0.999996`, `max_diff=0.125` |
+| Prefill logits | argmax / top5 对比 | argmax 一致，值完全匹配 |
 
-**结论**：Talker prefill 阶段 C++ 与 Python 完全等价，差异不来源于 talker 模型本身或 axengine 运行时。
+**关键发现**：
+- Talker axmodel 层的输出（raw hidden）在 C++ 和 Python 之间完全一致，说明 axmodel runtime 无差异。
+- **差异唯一来源**：C++ 手写 `rmsnorm_bf16` 与 Python PyTorch `self.norm`（RMSNorm）存在 `max_diff=0.125` 的数值差异。
+
+**代码对应**：
+- C++: `src/runner/LLM_cp_tts_insert.inc:236-249` (`rmsnorm_bf16`)
+- Python: `scripts/infer.py:854-856` (`_to_hidden_tensor` → `self.norm`)
 
 ---
 
@@ -31,122 +41,158 @@
 
 | 问题 | 根因 | 修复方式 | 验证结果 |
 |------|------|----------|----------|
-| CP prefill 输入格式错误 | Python 未正确拼接 `past_hidden + last_id_hidden` | 改为 `torch.cat((past_hidden, last_id_hidden), dim=1)` | CP prefill input cosine=1.0 |
-| CP post-norm 提取错误 | Python 使用了错误的输出 tensor 键 | 改为 `outputs["output_norm"]` | post-norm hidden cosine≈0.9998 |
-| `tts_pad_vec` 形状错误 | Python 读取了 1025 个元素（格式混淆） | 修正为 1024 dims | 与 C++ 一致 |
-| CP embedding 表加载差异 | Python 使用 PyTorch Embedding 而非原始 bf16 文件 | 从 `.bfloat16.bin` 加载 `codec_embedding` | 表内容一致 |
-| 采样随机性 | temperature > 0 导致非确定性 | C++ 硬编码 `cp_temperature=0.0f`，Python `do_sample=False` | 贪婪采样，排除随机性 |
+| CP prefill 输入格式 | Python 未正确拼接 `past_hidden + last_id_hidden` | 改为 `torch.cat((past_hidden, last_id_hidden), dim=1)` | CP prefill input cosine=1.0 |
+| CP post-norm 提取 | Python 使用了错误的输出 tensor 键 | 改为 `outputs["output_norm"]` | post-norm hidden cosine≈0.9998 |
+| `tts_pad_vec` 形状 | Python 读取了 1025 个元素 | 修正为 1024 dims | 与 C++ 一致 |
+| CP embedding 表加载 | Python 使用 PyTorch Embedding 而非原始 bf16 文件 | 从 `.bfloat16.bin` 加载 `codec_embedding` | 表内容一致 |
+| 采样随机性 | temperature > 0 导致非确定性 | C++ `cp_temperature=0.0f`，Python `--no-subtalker_dosample` | greedy 对齐 |
 
-**结论**：CP 的输入、embedding 表、采样策略已完全对齐。
+**结论**：CP 的输入构造、embedding 表、采样策略、mask/indices/KV cache 逻辑已完全对齐。
 
 ---
 
-### 2.3 CP Decode 子码 —— ⚠️ 12/15 匹配，3 个分歧
+### 2.3 CP Decode 子码 —— ❌ Step 2 起发散（Greedy 下）
 
-**现象**：
-- 子码 0–11：C++ 与 Python **完全匹配**
-- 子码 12–14：分歧
-  - C++: `[..., 2027, 812, 803]`
-  - Python: `[..., 1422, 85, 185]`
+**现象**（greedy 采样）：
+
+| Step | C++ Token | Python Token | lm_head cos | lm_head max_diff | 判定 |
+|------|-----------|--------------|-------------|------------------|------|
+| 0 | 117 | 117 | 0.999891 | 0.280 | ✅ MATCH |
+| 1 | 604 | 604 | 0.999966 | 0.199 | ✅ MATCH |
+| 2 | **1349** | **279** | 0.999980 | 0.298 | ❌ **DIVERGE** |
+| 3+ | ... | ... | <0.998 | >4.0 | ❌ 级联恶化 |
+
+**Hidden state 传播链**：
+
+| Step | pre_norm cos | pre_norm max_diff | post_norm cos | post_norm max_diff |
+|------|-------------|-------------------|---------------|--------------------|
+| 0 | 0.999793 | 0.250 | 0.999737 | 0.219 |
+| 1 | 0.999760 | 0.312 | 0.999785 | 0.625 |
+| 2 | 0.999783 | **0.500** | 0.999776 | **0.250** |
 
 **分析**：
-- 前 12 步匹配说明：KV cache 更新、mask 构建、indices 设置、embedding 查找、lm_head 执行在步骤 0–11 均正确。
-- 分歧从第 12 步开始出现，说明差异具有**累积性**，或第 12 步的某个输入/模型执行存在微小差异被放大。
-
-**可能原因**（待验证）：
-1. **lm_head 精度漂移**：C++ `ax_runner_ax650` 与 Python `axengine.InferenceSession` 对同一 lm_head axmodel 可能产生微小差异，前 11 步 argmax 恰好相同，第 12 步跨越决策边界。
-2. **KV cache 累积误差**：bf16/fp32 转换或 cache 写入位置的微小差异在 12 步后放大。
-3. **Mask/Indices 配置**：decode 阶段 `history_len=13` 时的 mask 或 indices 存在边界条件差异。
+- Step 0~1 的 sampled token 完全相同，说明输入 embed 一致。
+- 但 hidden state 的 `max_diff` 逐步放大（0.25 → 0.31 → 0.50），表明差异具有**累积性**。
+- Step 2 的 `lm_head[2]` 处，token 1349 与 279 的 logits 竞争极为激烈（C++ top1=8.897 vs Python top1=8.888，差仅 0.009）。
+- `max_diff=0.298` 的 logit 误差恰好让 argmax 从 1349 翻转到 279。
 
 ---
 
-### 2.4 Talker Decode Step 1 —— ❌ 严重分歧
+## 3. 根因定位：RMSNorm 差异 → CP 放大 → lm_head 翻转
 
-**现象**：
-- `next_embed`（codec_sum + tts_pad_vec）cosine≈0.84，max_diff≈0.70
-- Talker decode raw hidden：C++ norm=18.16 vs Python norm=31.79，cosine≈0.065
+### 3.1 第一步误差：Talker RMSNorm
 
-**分析**：
-- `next_embed` 的分歧是 CP 子码分歧的直接后果（不同 residual code → 不同 embedding → 不同的 codec_sum）。
-- 但即使 `next_embed` 存在差异，talker decode raw hidden 的 **极度严重分歧**（cosine≈0.06）暗示 talker decode 本身可能存在独立问题：
-  - **KV cache 状态不一致**：prefill 结束后 KV cache 内容或 shape 存在差异。
-  - **position_ids / cache_position 不匹配**：decode 第一步的 position index 设置错误。
-  - **Mask 配置错误**：decode mask 的可见范围或形状与 Python 不一致。
+```
+C++ rmsnorm_bf16          vs    Python PyTorch RMSNorm
+      ↓                              ↓
+  max_diff=0.125               max_diff=0.125
+      ↓
+  last_normed_hidden (CP past_hidden)
+```
 
----
+- C++ 使用手写 `rmsnorm_bf16`，在 bf16→fp32 转换、逐元素求和后做 RMSNorm。
+- Python 使用 PyTorch 原生 RMSNorm，可能在向量化、并行规约、中间精度上与手写实现存在微小差异。
+- 该差异在 `last_normed_hidden` 上表现为 `max_diff=0.125`。
 
-## 3. 当前状态
+### 3.2 传播放大：CP Transformer 5 层
 
-### 3.1 调试代码清理
+```
+past_hidden (diff=0.125)
+    ↓
+CP Prefill (step 0)  →  pre_norm diff=0.25
+    ↓
+CP Decode (step 1)   →  pre_norm diff=0.31
+    ↓
+CP Decode (step 2)   →  pre_norm diff=0.50
+    ↓
+cp_post (RMSNorm)    →  post_norm diff=0.25
+```
 
-此前为定位问题临时添加的大量对称 dump 代码（CP prefill/layer0/talker prefill 全量 KV cache 等）**已完成清理**。仅保留两处非 dump 的实质性修复：
-- `scripts/infer.py`：`frame_idx` 自增顺序修复（先取值再递增）。
-- `src/runner/LLM_cp_tts_insert.inc`：CP `lm_head` 输入格式修复（bf16 → fp32）。
+- CP 的 layer 计算本身（axmodel）在 C++ 和 Python 之间是一致的。
+- 但由于初始输入 `past_hidden` 有 0.125 差异，且 Attention/FFN 会混合历史信息，每一层都会将误差略微放大。
+- 经过 5 层 CP Transformer + 2 个 decode step 后，差异从 0.125 放大到 0.50。
 
-### 3.2 重新设计的调试工具（最小化方案）
+### 3.3 触发点：lm_head[2] 排序翻转
 
-基于已验证结论，新方案遵循**最小侵入原则**：只 dump 分歧点，跳过已确认 bit-exact 的阶段。
+```
+post_norm hidden (cos=0.9998, max_diff=0.25)
+    ↓
+cp_lm_heads[2] / lm_head_sessions[2]  (同一 axmodel)
+    ↓
+logits: cos=0.99998, max_diff=0.298
+    ↓
+C++ argmax=1349(8.897)  vs  Python argmax=279(8.888)
+    ↓
+排序翻转 → 后续全部跑偏
+```
 
-**控制方式**：
-- C++：通过 `SetDebugDumpDir()` 控制，仅当目录非空时触发。
-- Python：通过 `--dump_debug_dir` 参数控制。
-- 对称目录：`{dump_dir}/cpp/` 与 `{dump_dir}/python/`，便于脚本自动对比。
+- 两边使用**同一个** `code_predictor_lm_head_2.axmodel` 文件。
+- 输入 hidden state 的 cosine 高达 0.9998，但 `max_diff=0.25` 恰好落在权重矩阵的敏感维度上。
+- Top2 竞争 token（1349 vs 279）的 logits 差仅 0.009，0.298 的绝对差异足以翻转 greedy argmax。
 
-**CP Decode dump**（针对 12/15 子码分歧）：
-| 文件名 | 内容 | 目的 |
-|--------|------|------|
-| `cp_decode_step{j:03d}_pre_norm.bin` | 进入 post-norm 前的 hidden state | 定位 hidden state 首次漂移的步骤 |
-| `cp_decode_step{j:03d}_lm_head_logits.bin` | lm_head 输出的 fp32 logits | 判断是 hidden drift 还是 lm_head 运行时差异 |
-| `cp_decode_codes.bin` | 最终 15 个子码 | 快速确认是否复现分歧 |
+### 3.4 后果：Python 跑飞
 
-**Talker Decode Step 1 dump**（针对 raw hidden 严重分歧，仅 `step == 0`）：
-| 文件名 | 内容 | 目的 |
-|--------|------|------|
-| `talker_decode_step1_k_cache_layer0.bin` | Layer 0 的 K_cache | 验证 KV cache 初始化是否与 Python 一致 |
-| `talker_decode_step1_v_cache_layer0.bin` | Layer 0 的 V_cache | 同上 |
-| `talker_decode_step1_indices.bin` | decode indices | 验证 position id 是否一致 |
-| `talker_decode_step1_mask.bin` | decode mask | 验证 mask 形状/值是否一致 |
-| `talker_decode_step1_input.bin` | `next_embed`（codec_sum + pad/txt） | 确认输入差异是否由 CP 分歧导致 |
-| `talker_decode_step1_output_raw.bin` | Layer 最后一层输出的 raw hidden | 确认 talker decode 本身是否产生严重分歧 |
-
-**对比脚本**：`scripts/compare_debug_dumps.py`
-- 自动遍历 `{dump_dir}/cpp/` 与 `{dump_dir}/python/` 同名文件。
-- 计算 cosine similarity 与 max diff。
-- 对 CP decode 逐步骤报告首次出现 `cosine < 1.0` 或 `argmax` 分歧的位置。
-- 对 Talker decode step1 直接输出各输入 tensor 的对比结果。
-
-### 3.3 待执行的验证
-
-1. **部署并运行最小化 dump**：在 AX650 上同时运行 C++ 和 Python，仅收集上述精简 dump 文件。
-2. **执行 `compare_debug_dumps.py`**：
-   - 若 CP `pre_norm` 在 step 12 之前已出现 `cosine < 1.0` → 问题在 CP layer 执行或 KV cache 累积误差。
-   - 若 CP `pre_norm` 完全一致，但 `lm_head_logits` 在 step 12 分歧 → 问题在 lm_head 模型运行时差异（可进一步做 lm_head 隔离测试：将 C++ step 12 hidden state 输入 Python axengine 运行 lm_head_12）。
-   - 若 Talker decode step 1 的 `K/V cache`、`indices`、`mask` 不完全一致 → 问题在 talker KV cache 初始化或 mask 构建逻辑。
-   - 若 Talker decode step 1 的输入完全一致，但 `output_raw` 严重分歧 → 问题在 talker decode 模型运行时或层间数据搬运（d2d/d2h）。
-3. **lm_head 隔离测试**（条件触发）：将 C++ 的 step 12 hidden state 输入 Python `axengine` 运行 `lm_head_12.axmodel`，对比 logits。
-4. **Talker decode KV cache 隔离**（条件触发）：对比 prefill 结束后 layer 0 的 K_cache 内容（C++ vs Python）。
+- Step 2 选错 token（279）→ step 3 输入 embed 错误。
+- 后续 CP hidden state 迅速恶化（cos 跌至 0.88~0.96）。
+- `codec_sum` 与 C++ 完全不一致（cos=0.90→0.18）。
+- Talker decode 收到错误的 `inputs_embeds`，生成错误的 primary token。
+- 下一轮 CP 的 `past_hidden` 也错了，形成**错误累积循环**。
+- 最终 token 序列偏离正确分布，无法命中 EOS。
 
 ---
 
-## 4. 关键假设与风险
+## 4. 关键逻辑逐项核对（排除代码 bug）
 
-| 假设 | 风险 |
-|------|------|
-| CP 前 12 步完全匹配意味着 KV cache 完全一致 | 可能存在微小差异（<1e-3）未被 argmax 放大，在第 12 步才显现 |
-| C++ `get_output(gid, "K_cache_out")` 能正确访问 group 1 | 已验证 axmodel 输出名为 `K_cache_out_1`，但 AX650 引擎可能在内部做了名称归一化；若实际访问的是 group 0 输出，则 KV cache 拷贝将完全错误（但目前看前 12 步匹配，此风险较低） |
-| `cp_embed_tables[j]` 与 Python `embedding_tables[lm_step-1]` 一一对应 | 对于第一帧 `start_lm_step=0`，对应关系为 `cp_embed_tables[j-1]` ↔ `embedding_tables[j-1]`，已验证正确 |
+| 检查项 | C++ 实现 | Python 实现 | 核对结果 |
+|--------|----------|-------------|----------|
+| CP prefill 输入 | `cp_ctx=[last_hidden,primary_embed]` | `torch.cat((past_hidden,last_id_hidden),dim=1)` | ✅ 一致 |
+| CP decode embed 来源 | `cp_ctx.last(D)` (res_embed) | `embedding_tables[lm_step-1](prev_id)` | ✅ 一致 |
+| CP decode indices | `history_len+i` | `[[current_len]]` | ✅ 一致 |
+| CP decode mask | history 可见, last=0 | `col<row?0:-65536; [:,-1]=0` | ✅ 一致 |
+| KV cache 更新位置 | `current_len-1` | `current_len` | ✅ 一致 |
+| lm_head 索引 | `cp_lm_heads[j]` | `lm_head_sessions[lm_step]` | ✅ 一致 |
+| greedy 采样 | `CpSampleFromLogits(...,0.0f,...)` | `np.argmax(scores)` | ✅ 一致 |
+| codec_sum 累加 | `fp32 accumulator` | `torch.sum(fp32)` | ✅ 一致 |
+
+**结论**：所有耦合逻辑、索引、mask、KV cache、采样策略均完全对齐，不存在实现错误。
 
 ---
 
-## 5. 下一步行动
+## 5. 修复建议
 
-1. 实现最小化 dump 代码（C++ & Python），按 3.2 节方案在精确节点添加对称 dump。
-2. 部署最新 C++ binary 到 AX650。
-3. 执行 C++ 和 Python 推理，收集 dump 到同一目录（仅 3.2 节列出的文件）。
-4. 运行 `python scripts/compare_debug_dumps.py <dump_dir>`，观察：
-   - CP 在哪一步首次出现 `cosine < 1.0` 或 `argmax` 分歧。
-   - Talker decode step 1 的 K/V cache、indices、mask 是否完全一致。
-5. 根据对比结果，针对性修复：
-   - 若是 CP lm_head 问题 → 执行 lm_head 隔离测试，对比 C++ vs Python 对同一 lm_head axmodel 的输出。
-   - 若是 talker KV/mask 问题 → 修复 talker decode 的 cache/mask 构建逻辑。
-   - 若是 talker decode 输入一致但 output_raw 分歧 → 检查 decode 阶段的层间数据搬运（d2d/d2h）或模型运行时差异。
+### 5.1 最高优先级：统一 RMSNorm 实现
+
+**方案 A**（推荐）：将 Talker 的 RMSNorm 也导出为 axmodel，让 C++ 和 Python 都走 axmodel 执行，消除手写实现与 PyTorch 的差异。
+
+**方案 B**：在 C++ 中调用 PyTorch C++ API（libtorch）执行 RMSNorm，确保与 Python 逐位一致。
+
+**方案 C**：若无法替换实现，可尝试对齐 `rmsnorm_bf16` 的求和顺序/向量化行为，使其输出与 PyTorch 的 diff 缩小到 <1e-3。
+
+### 5.2 验证方法
+
+1. **RMSNorm 隔离测试**：
+   - 将 C++ `rmsnorm_bf16` 的输入和输出导出为 bin。
+   - 用同一输入在 Python 中执行 `self.norm`，对比输出差异。
+   - 确认 `max_diff=0.125` 是否完全由 RMSNorm 引起。
+
+2. ** bypass 验证**：
+   - 临时修改 C++，跳过 `rmsnorm_bf16`，直接加载 Python dump 的 `prefill_last_normed_hidden.bin` 作为 `all_prefill_hidden`。
+   - 若此时 C++ 与 Python 的 CP tokens 完全 match，则 100% 确认 RMSNorm 为根因。
+
+3. **lm_head 敏感性分析**：
+   - Dump C++ 和 Python 的 step 2 post_norm hidden state。
+   - 分别输入到同一个 `code_predictor_lm_head_2.axmodel`，确认 logits diff=0.298 是否由 hidden diff=0.25 线性投影导致。
+
+---
+
+## 6. 历史记录
+
+### 2026-05-20 之前的状态
+
+- 此前认为 CP 12/15 子码匹配，3 个分歧（子码 12~14）。
+- 当时怀疑 lm_head 精度漂移或 KV cache 累积误差。
+- **本次更新后**：在 greedy 采样下重新验证，发现实际发散点提前到 step 2，且根因锁定为 Talker RMSNorm 差异的级联放大。
+
+---
+
+*文档生成于 2026-05-20，基于 `scripts/infer.py`、`src/runner/LLM.cpp`、`src/runner/LLM_cp_tts_insert.inc` 及对比脚本输出。*

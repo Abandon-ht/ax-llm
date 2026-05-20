@@ -186,6 +186,11 @@ private:
     bool enable_top_k_sampling = false;
     int top_k = 1;
 
+    bool enable_suppress_tokens_ = false;
+    int suppress_range_begin_ = -1;
+    int suppress_range_end_ = -1;
+    int suppress_except_token_ = -1;
+
     std::mt19937 rng_;
 
 public:
@@ -220,6 +225,14 @@ public:
     {
         enable_top_k_sampling = enable;
         this->top_k = top_k;
+    }
+
+    void set_suppress_range(int begin, int end, int except_token = -1)
+    {
+        enable_suppress_tokens_ = true;
+        suppress_range_begin_ = begin;
+        suppress_range_end_ = end;
+        suppress_except_token_ = except_token;
     }
 
     void set_seed(int seed)
@@ -330,7 +343,18 @@ public:
         if (enable_diversity_penalty)
             apply_diversity_penalty(logits, common_phrases, diversity_penalty);
 
-        float temp = enable_temperature ? temperature : 1.0f;
+        if (enable_suppress_tokens_ && suppress_range_begin_ >= 0)
+        {
+            const int end = std::min(suppress_range_end_, static_cast<int>(logits.size()));
+            const float neg_inf = -1e30f;
+            for (int i = suppress_range_begin_; i < end; ++i)
+            {
+                if (i != suppress_except_token_)
+                    logits[i] = neg_inf;
+            }
+        }
+
+        float temp = enable_temperature ? temperature : 0.0f;
         int k = enable_top_k_sampling ? top_k : 0;
         float p = enable_top_p_sampling ? top_p : 1.0f;
         float rep_pen = enable_repetition_penalty ? repetition_penalty : 1.0f;
