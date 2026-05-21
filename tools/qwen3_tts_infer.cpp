@@ -146,7 +146,6 @@ struct Args
     int codec_eos_token_id = 2150;
     std::string output_prefix;
     int seed = -1;
-    std::string debug_dump_dir;
 };
 
 static void print_usage(const char *prog)
@@ -206,10 +205,6 @@ static bool parse_args(int argc, char **argv, Args &args)
         {
             args.seed = std::atoi(argv[++i]);
         }
-        else if (strcmp(argv[i], "--debug-dump-dir") == 0 && i + 1 < argc)
-        {
-            args.debug_dump_dir = argv[++i];
-        }
         else
         {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
@@ -245,9 +240,6 @@ int main(int argc, char **argv)
     printf("output_prefix        : %s\n", args.output_prefix.c_str());
     if (args.seed >= 0)
         printf("seed                 : %d\n", args.seed);
-    if (!args.debug_dump_dir.empty())
-        printf("debug_dump_dir       : %s\n", args.debug_dump_dir.c_str());
-
     // ── 0. 读取 meta.json ──────────────────────────────────────────────────
     const std::string meta_path = args.npy_dir + "/meta.json";
     if (!std::filesystem::exists(meta_path))
@@ -385,12 +377,6 @@ int main(int argc, char **argv)
         return 1;
     }
     printf("[INFO] LLM initialized OK\n\n");
-
-    if (!args.debug_dump_dir.empty())
-    {
-        llm.SetDebugDumpDir(args.debug_dump_dir);
-        printf("[INFO] SetDebugDumpDir = %s\n", args.debug_dump_dir.c_str());
-    }
 
     // ── 4. 随机种子（采样参数由 post_config.json 控制，CLI 不覆盖）─
     LLMPostprocess *postprocess = llm.getPostprocess();

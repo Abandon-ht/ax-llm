@@ -460,25 +460,7 @@ int main(int argc, char **argv)
         ALOGE("RunTts failed or no frames generated");
     }
 
-    // ── 5. 可选：从 input_ids.npy 验证 ────────────────────────────────────
-    const std::string ids_path = npy_dir + "/input_ids.npy";
-    if (std::filesystem::exists(ids_path))
-    {
-        std::vector<int64_t> input_ids;
-        std::vector<size_t> ids_shape;
-        if (load_npy_int64(ids_path, input_ids, ids_shape))
-        {
-            int audio_slots_in_ids = 0;
-            for (auto v : input_ids)
-                if (v == audio_token_id) ++audio_slots_in_ids;
-            printf("[DEBUG] input_ids shape=[");
-            for (size_t i = 0; i < ids_shape.size(); ++i)
-                printf("%s%zu", i ? "," : "", ids_shape[i]);
-            printf("], audio_pad count=%d\n", audio_slots_in_ids);
-        }
-    }
-
-    // ── 6. 反初始化 ────────────────────────────────────────────────────────
+    // ── 5. 反初始化 ────────────────────────────────────────────────────────
     llm.Deinit();
 
 #ifndef USE_AXCL

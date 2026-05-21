@@ -172,9 +172,6 @@ public:
     // Set logit suppression range for talker (e.g. suppress [2048, 3072) except EOS).
     void SetSuppressRange(int begin, int end, int except_token = -1);
 
-    // Debug: set directory for dumping intermediate tensors
-    void SetDebugDumpDir(const std::string &dir);
-
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

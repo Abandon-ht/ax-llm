@@ -189,23 +189,25 @@ if(BUILD_AX650)
     target_include_directories(qwen3_tts_debug PRIVATE ${BSP_MSP_DIR}/include)
     target_include_directories(qwen3_tts_ablation PRIVATE ${BSP_MSP_DIR}/include)
     target_include_directories(qwen3_tts_infer PRIVATE ${BSP_MSP_DIR}/include)
-    # ONNX Runtime for TTS tools (ablation + infer + debug)
-    set(ONNXRUNTIME_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/onnxruntime-linux-aarch64-1.26.0/include)
-    set(ONNXRUNTIME_LIB_DIR ${CMAKE_SOURCE_DIR}/onnxruntime-linux-aarch64-1.26.0/lib)
-    if(EXISTS ${ONNXRUNTIME_INCLUDE_DIR}/onnxruntime_cxx_api.h)
-        target_include_directories(axllm PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-        target_include_directories(llm_smoke PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-        target_include_directories(qwen3_asr_debug PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-        target_include_directories(qwen3_tts_ablation PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-        target_include_directories(qwen3_tts_infer PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-        target_include_directories(qwen3_tts_debug PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-        target_compile_definitions(qwen3_tts_ablation PRIVATE USE_ONNX_RMSNORM)
-        target_compile_definitions(qwen3_tts_infer PRIVATE USE_ONNX_RMSNORM)
-        target_compile_definitions(qwen3_tts_debug PRIVATE USE_ONNX_RMSNORM)
-        message(STATUS "ONNX Runtime found: ${ONNXRUNTIME_INCLUDE_DIR}")
-    else()
-        message(FATAL_ERROR "ONNX Runtime headers not found at ${ONNXRUNTIME_INCLUDE_DIR}")
+    # ONNX Runtime for TTS ablation tool only (ONNX Talker / ONNX CP modes)
+    set(ONNXRUNTIME_CANDIDATES
+        "${CMAKE_SOURCE_DIR}/onnxruntime-linux-aarch64-1.26.0"
+        "/home/m5stack/Workspace/kaldi/sherpa-onnx/build-aarch64-linux-gnu/_deps/onnxruntime-src"
+    )
+    set(ONNXRUNTIME_INCLUDE_DIR "")
+    set(ONNXRUNTIME_LIB_DIR "")
+    foreach(CAND ${ONNXRUNTIME_CANDIDATES})
+        if(EXISTS ${CAND}/include/onnxruntime_cxx_api.h AND EXISTS ${CAND}/lib/libonnxruntime.so)
+            set(ONNXRUNTIME_INCLUDE_DIR ${CAND}/include)
+            set(ONNXRUNTIME_LIB_DIR ${CAND}/lib)
+            message(STATUS "ONNX Runtime found: ${CAND}")
+            break()
+        endif()
+    endforeach()
+    if(NOT ONNXRUNTIME_INCLUDE_DIR)
+        message(FATAL_ERROR "ONNX Runtime not found. Searched: ${ONNXRUNTIME_CANDIDATES}")
     endif()
+    target_include_directories(qwen3_tts_ablation PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
     # link_directories 是全局的，用 target 属性更干净；CMake < 3.13 没有
     # target_link_directories，改用 set_target_properties 设置 LINK_FLAGS 或
     # 直接传绝对路径库目录给 target_link_libraries 的 -L 形式：
@@ -243,34 +245,23 @@ if(BUILD_AX650)
     )
     target_link_libraries(qwen3_tts_infer
         -L${BSP_MSP_DIR}/lib
-        -L${ONNXRUNTIME_LIB_DIR}
         ax_engine ax_interpreter ax_sys
-        onnxruntime
-        pthread tokenizer openai_api::server
-        ${AXLLM_VISION_LIBS}
-    )
-    target_link_libraries(qwen3_tts_debug
-        -L${BSP_MSP_DIR}/lib
-        -L${ONNXRUNTIME_LIB_DIR}
-        ax_engine ax_interpreter ax_sys
-        onnxruntime
         pthread tokenizer openai_api::server
         ${AXLLM_VISION_LIBS}
     )
     # Set RPATH so binaries find libonnxruntime.so.1 in ../lib without LD_LIBRARY_PATH
-    set_target_properties(qwen3_tts_ablation qwen3_tts_infer qwen3_tts_debug
+    set_target_properties(qwen3_tts_ablation
         PROPERTIES INSTALL_RPATH "$ORIGIN/../lib"
     )
-    # Install ONNX Runtime shared lib into lib/ (renamed to the SONAME expected by the linker)
-    install(FILES ${ONNXRUNTIME_LIB_DIR}/libonnxruntime.so.1.26.0
-            DESTINATION lib
-            RENAME libonnxruntime.so.1)
-    target_link_libraries(qwen3_tts_infer
-        -L${BSP_MSP_DIR}/lib
-        ax_engine ax_interpreter ax_sys
-        pthread tokenizer openai_api::server
-        ${AXLLM_VISION_LIBS}
-    )
+    # Install ONNX Runtime shared lib into lib/ if it exists
+    if(EXISTS ${ONNXRUNTIME_LIB_DIR}/libonnxruntime.so.1.26.0)
+        install(FILES ${ONNXRUNTIME_LIB_DIR}/libonnxruntime.so.1.26.0
+                DESTINATION lib
+                RENAME libonnxruntime.so.1)
+    elseif(EXISTS ${ONNXRUNTIME_LIB_DIR}/libonnxruntime.so)
+        install(FILES ${ONNXRUNTIME_LIB_DIR}/libonnxruntime.so
+                DESTINATION lib)
+    endif()
     install(TARGETS axllm DESTINATION bin)
     install(TARGETS llm_smoke DESTINATION bin)
     install(TARGETS qwen3_asr_debug DESTINATION bin)

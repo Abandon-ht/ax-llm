@@ -178,88 +178,6 @@ public:
         return PackResult(outputs, hidden_size, /*is_prefill=*/false);
     }
 
-    void DumpPrefillKVCache(const std::string &dir, const Result &result, int prefill_len) const
-    {
-        namespace fs = std::filesystem;
-        fs::create_directories(dir);
-        nlohmann::json meta;
-        meta["prefill_len"] = prefill_len;
-        meta["num_kv_tensors"] = (int)result.state.kv_cache.size();
-        nlohmann::json tensors = nlohmann::json::array();
-
-        for (size_t i = 0; i < result.state.kv_cache.size(); ++i) {
-            const auto &tensor = result.state.kv_cache[i];
-            auto shape = tensor.GetTensorTypeAndShapeInfo().GetShape();
-            const float *data = tensor.GetTensorData<float>();
-            int64_t total = 1;
-            for (auto s : shape) total *= s;
-
-            // Parse layer index and kv type from output name
-            int layer_idx = -1;
-            std::string kv_type;
-            if (i + 2 < prefill_out_names_str_.size()) {
-                const std::string &name = prefill_out_names_str_[i + 2];
-                std::string lower = name;
-                std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-                if (lower.find("key") != std::string::npos || lower.find(".k") != std::string::npos) kv_type = "k";
-                else if (lower.find("val") != std::string::npos || lower.find(".v") != std::string::npos) kv_type = "v";
-                // Extract first number as layer index
-                size_t pos = 0;
-                while (pos < name.size() && !std::isdigit(name[pos])) ++pos;
-                if (pos < name.size()) layer_idx = std::atoi(name.c_str() + pos);
-            }
-
-            std::vector<float> buf;
-            if (shape.size() == 4 && shape[0] == 1) {
-                // [1, num_heads, seq_len, head_dim] -> [seq_len, num_heads*head_dim]
-                int num_heads = static_cast<int>(shape[1]);
-                int seq_len   = static_cast<int>(shape[2]);
-                int head_dim  = static_cast<int>(shape[3]);
-                buf.resize((size_t)seq_len * num_heads * head_dim);
-                for (int s = 0; s < seq_len; ++s) {
-                    for (int h = 0; h < num_heads; ++h) {
-                        for (int d = 0; d < head_dim; ++d) {
-                            int src_idx = h * seq_len * head_dim + s * head_dim + d;
-                            int dst_idx = s * num_heads * head_dim + h * head_dim + d;
-                            buf[(size_t)dst_idx] = data[src_idx];
-                        }
-                    }
-                }
-            } else if (shape.size() == 3 && shape[0] == 1) {
-                // [1, seq_len, hidden_size]
-                int seq_len = static_cast<int>(shape[1]);
-                int hidden  = static_cast<int>(shape[2]);
-                buf.assign(data, data + (size_t)seq_len * hidden);
-            } else {
-                buf.assign(data, data + total);
-            }
-
-            char fname[256];
-            if (layer_idx >= 0 && !kv_type.empty()) {
-                snprintf(fname, sizeof(fname), "layer_%02d_%s.bin", layer_idx, kv_type.c_str());
-            } else {
-                snprintf(fname, sizeof(fname), "kv_%03zu.bin", i);
-            }
-            std::string path = (fs::path(dir) / fname).string();
-            FILE *fp = fopen(path.c_str(), "wb");
-            if (fp) {
-                fwrite(buf.data(), sizeof(float), buf.size(), fp);
-                fclose(fp);
-            }
-
-            nlohmann::json tinfo;
-            tinfo["filename"] = fname;
-            tinfo["name"] = (i + 2 < prefill_out_names_str_.size()) ? prefill_out_names_str_[i + 2] : "";
-            tinfo["orig_shape"] = shape;
-            tinfo["dump_shape"] = {(int)(buf.size() / prefill_len), prefill_len};
-            tensors.push_back(tinfo);
-        }
-        meta["tensors"] = tensors;
-        std::string meta_path = (fs::path(dir) / "meta.json").string();
-        std::ofstream ofs(meta_path);
-        ofs << meta.dump(2);
-    }
-
 private:
     Ort::Env env_;
     Ort::SessionOptions sess_opts_;
@@ -651,7 +569,6 @@ int main(int argc, char **argv)
     LLM llm;
     if (!llm.Init(attr)) { ALOGE("LLM::Init failed"); return 1; }
     llm.ResetKVCache();
-    llm.SetDebugDumpDir(npy_dir);
 
     // ── 4. 初始化 ONNX 模型（如需要）────────────────────────────────────────
     std::unique_ptr<OnnxTalker> onnx_talker;
@@ -767,33 +684,6 @@ int main(int argc, char **argv)
 
         // ONNX Talker prefill
         auto pr = onnx_talker->Prefill(prefill_embeds_fp32.data(), S, hidden_size);
-
-        // ---- Debug dump ONNX prefill outputs ----
-        {
-            std::string dir = npy_dir.back() == '/' ? npy_dir : npy_dir + "/";
-            std::string lh_path = dir + "debug_talker_prefill_last_hidden_onnx.bin";
-            FILE *fp = fopen(lh_path.c_str(), "wb");
-            if (fp) {
-                fwrite(pr.last_hidden.data(), sizeof(float), pr.last_hidden.size(), fp);
-                fclose(fp);
-                printf("[DEBUG] Saved ONNX prefill last_hidden -> %s\n", lh_path.c_str());
-            }
-            std::string lg_path = dir + "debug_talker_prefill_logits_onnx.bin";
-            fp = fopen(lg_path.c_str(), "wb");
-            if (fp) {
-                fwrite(pr.logits.data(), sizeof(float), pr.logits.size(), fp);
-                fclose(fp);
-                printf("[DEBUG] Saved ONNX prefill logits -> %s\n", lg_path.c_str());
-            }
-        }
-
-        // ---- Debug dump ONNX KV cache ----
-        {
-            std::string dir = npy_dir.back() == '/' ? npy_dir : npy_dir + "/";
-            std::string kvcache_dir = dir + "debug_talker_kvcache_onnx";
-            onnx_talker->DumpPrefillKVCache(kvcache_dir, pr, S);
-            printf("[DEBUG] Saved ONNX KV cache -> %s\n", kvcache_dir.c_str());
-        }
 
         int first_primary_code = SampleFromLogits(
             pr.logits.data(), static_cast<int32_t>(pr.logits.size()), talker_vocab_size,

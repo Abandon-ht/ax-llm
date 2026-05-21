@@ -19,21 +19,7 @@
             cp_layers[i].filename = path;
             int ret = cp_layers[i].layer.init(static_cast<const char*>(path), (int)-1);
             if (ret != 0) { ALOGE("init cp layer(%s) failed", path); return false; }
-            if (i == 0) {
-                ALOGI("CP layer0 groups=%d", cp_layers[0].layer.get_num_input_groups());
-                for (int gid = 0; gid < cp_layers[0].layer.get_num_input_groups(); ++gid) {
-                    ALOGI("  group %d inputs:", gid);
-                    for (int k = 0; k < cp_layers[0].layer.get_num_inputs(); ++k) {
-                        auto &t = cp_layers[0].layer.get_input(gid, k);
-                        ALOGI("    in[%d]: name=%s shape=%s nSize=%d", k, t.sName.c_str(), shape_to_str2(t.vShape).c_str(), t.nSize);
-                    }
-                    ALOGI("  group %d outputs:", gid);
-                    for (int k = 0; k < cp_layers[0].layer.get_num_outputs(); ++k) {
-                        auto &t = cp_layers[0].layer.get_output(gid, k);
-                        ALOGI("    out[%d]: name=%s shape=%s nSize=%d", k, t.sName.c_str(), shape_to_str2(t.vShape).c_str(), t.nSize);
-                    }
-                }
-            }
+            // cp_layers init ok
         }
         {
             std::snprintf(path, sizeof(path), "%s/qwen3_tts_talker_code_predictor_post.axmodel", cp_dir.c_str());
@@ -45,15 +31,6 @@
                 if (s.empty()) s = "(none)";
                 return s;
             };
-            ALOGI("CP post inputs=%d outputs=%d", cp_post.get_num_inputs(), cp_post.get_num_outputs());
-            for (int i = 0; i < cp_post.get_num_inputs(); ++i) {
-                auto &t = cp_post.get_input(i);
-                ALOGI("  CP post in[%d]: name=%s shape=%s nSize=%d", i, t.sName.c_str(), shape_to_str2(t.vShape).c_str(), t.nSize);
-            }
-            for (int i = 0; i < cp_post.get_num_outputs(); ++i) {
-                auto &t = cp_post.get_output(i);
-                ALOGI("  CP post out[%d]: name=%s shape=%s nSize=%d", i, t.sName.c_str(), shape_to_str2(t.vShape).c_str(), t.nSize);
-            }
         }
         cp_lm_heads.resize(15);
         for (int i = 0; i < 15; i++)
@@ -61,23 +38,6 @@
             std::snprintf(path, sizeof(path), "%s/code_predictor_lm_head_%d.axmodel", cp_dir.c_str(), i);
             int ret = cp_lm_heads[i].init(static_cast<const char*>(path), (int)-1);
             if (ret != 0) { ALOGE("init cp lm_head(%s) failed", path); return false; }
-            if (i == 0) {
-                auto shape_to_str2 = [](const std::vector<unsigned int> &shape) -> std::string {
-                    std::string s;
-                    for (size_t i2 = 0; i2 < shape.size(); ++i2) { if (i2) s.push_back('x'); s += std::to_string(shape[i2]); }
-                    if (s.empty()) s = "(none)";
-                    return s;
-                };
-                ALOGI("CP lm_head_0 inputs=%d outputs=%d", cp_lm_heads[0].get_num_inputs(), cp_lm_heads[0].get_num_outputs());
-                for (int k = 0; k < cp_lm_heads[0].get_num_inputs(); ++k) {
-                    auto &t = cp_lm_heads[0].get_input(k);
-                    ALOGI("  CP lm_head_0 in[%d]: name=%s shape=%s nSize=%d", k, t.sName.c_str(), shape_to_str2(t.vShape).c_str(), t.nSize);
-                }
-                for (int k = 0; k < cp_lm_heads[0].get_num_outputs(); ++k) {
-                    auto &t = cp_lm_heads[0].get_output(k);
-                    ALOGI("  CP lm_head_0 out[%d]: name=%s shape=%s nSize=%d", k, t.sName.c_str(), shape_to_str2(t.vShape).c_str(), t.nSize);
-                }
-            }
         }
         // load 15 embedding tables: 2048 x 1024 x 2 = 4MB each
         cp_embed_tables.resize(15);
@@ -134,8 +94,6 @@
                 } else if (cp_kv_dim > 0) {
                     detected = (int)(t_k.nSize / sizeof(unsigned short)) / cp_kv_dim;
                 }
-                ALOGI("CP K_cache group %d shape=%s detected_kv_cache_num=%d",
-                      gid, shape_to_str2(t_k.vShape).c_str(), detected);
                 if (detected > cp_kv_cache_num) cp_kv_cache_num = detected;
             }
             if (cp_kv_cache_num <= 0) {
@@ -146,8 +104,6 @@
                 else
                     cp_kv_cache_num = cp_prefill_token_num;
             }
-            ALOGI("CP kv_cache_num=%d (max from all groups)", cp_kv_cache_num);
-            ALOGI("CP prefill_gid=%d decode_gid=%d token_num=%d kv_cache_num=%d", cp_prefill_gid, cp_decode_gid, cp_prefill_token_num, cp_kv_cache_num);
         }
 
         // Detect cp_kv_dim from K_cache shape
@@ -158,7 +114,6 @@
             } else {
                 cp_kv_dim = (t_k.nSize / sizeof(unsigned short)) / cp_kv_cache_num;
             }
-            ALOGI("CP kv_dim=%d (from K_cache shape)", cp_kv_dim);
         }
 
         // Pre-allocate CP KV caches
@@ -169,66 +124,7 @@
             cp_v_cache[m].assign((size_t)cp_kv_cache_num * cp_kv_dim, 0);
         }
 
-        // Load talker norm gamma for CP input
-        std::string talker_dir;
-        {
-            talker_dir = (std::filesystem::path(cp_dir) / ".." / "talker").lexically_normal().string();
-            std::string norm_path = talker_dir + "/talker.model.norm.weight.bfloat16.bin";
-            std::ifstream fin(norm_path, std::ios::binary | std::ios::ate);
-            if (fin.is_open()) {
-                std::streamsize sz = fin.tellg();
-                fin.seekg(0, std::ios::beg);
-                int n = sz / sizeof(unsigned short);
-                cp_norm_gamma.resize(n);
-                std::vector<unsigned short> tmp(n);
-                fin.read((char*)tmp.data(), sz);
-                for (int i = 0; i < n; ++i) cp_norm_gamma[i] = bfloat16(tmp[i]).fp32();
-                ALOGI("Loaded talker norm gamma from %s, elems=%d", norm_path.c_str(), n);
-            } else {
-                ALOGW("Cannot load talker norm gamma from %s, CP input will be unnormalized!", norm_path.c_str());
-            }
-        }
 
-        // Load ONNX Runtime RMSNorm session (optional)
-#ifdef USE_ONNX_RMSNORM
-        {
-            std::string onnx_path = talker_dir + "/talker_rmsnorm.onnx";
-            if (std::filesystem::exists(onnx_path)) {
-                try {
-                    ort_env.reset(new Ort::Env(ORT_LOGGING_LEVEL_WARNING, "talker_rmsnorm"));
-                    ort_memory_info.reset(new Ort::MemoryInfo(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)));
-                    Ort::SessionOptions session_options;
-                    session_options.SetIntraOpNumThreads(1);
-                    session_options.SetInterOpNumThreads(1);
-                    rmsnorm_session.reset(new Ort::Session(*ort_env, onnx_path.c_str(), session_options));
-                    // Query input/output names
-                    Ort::AllocatorWithDefaultOptions allocator;
-                    size_t num_inputs = rmsnorm_session->GetInputCount();
-                    size_t num_outputs = rmsnorm_session->GetOutputCount();
-                    if (num_inputs >= 1 && num_outputs >= 1) {
-                        Ort::AllocatedStringPtr input_name_ptr = rmsnorm_session->GetInputNameAllocated(0, allocator);
-                        Ort::AllocatedStringPtr output_name_ptr = rmsnorm_session->GetOutputNameAllocated(0, allocator);
-                        ort_input_names.push_back(input_name_ptr.get());
-                        ort_output_names.push_back(output_name_ptr.get());
-                        // Keep the strings alive by copying
-                        ort_input_strings_.push_back(std::string(input_name_ptr.get()));
-                        ort_output_strings_.push_back(std::string(output_name_ptr.get()));
-                        ort_input_names[0] = ort_input_strings_[0].c_str();
-                        ort_output_names[0] = ort_output_strings_[0].c_str();
-                        rmsnorm_onnx_loaded = true;
-                        ALOGI("Loaded ONNX RMSNorm from %s (in=%zu out=%zu)", onnx_path.c_str(), num_inputs, num_outputs);
-                    } else {
-                        ALOGE("ONNX RMSNorm model has unexpected in/out count");
-                    }
-                } catch (const Ort::Exception &e) {
-                    ALOGE("Failed to load ONNX RMSNorm from %s: %s", onnx_path.c_str(), e.what());
-                    rmsnorm_onnx_loaded = false;
-                }
-            } else {
-                ALOGW("ONNX RMSNorm not found at %s, using hand-written rmsnorm_bf16", onnx_path.c_str());
-            }
-        }
-#endif
 
         if (!_attr.post_config_path.empty() && std::filesystem::exists(_attr.post_config_path))
         {
@@ -260,7 +156,6 @@
         }
 
         cp_loaded = true;
-        ALOGI(">>> [RNE_FIX] bfloat16 round-to-nearest-even ENABLED <<<");
         return true;
     }
 
@@ -276,25 +171,6 @@
         cp_loaded = false;
     }
 
-    static inline void rmsnorm_bf16(unsigned short *dst, const unsigned short *src,
-                                     const float *gamma, int n, float eps=1e-6)
-    {
-        static int call_count = 0;
-        if (call_count < 3) {
-            ALOGI("[RNE_FIX] rmsnorm_bf16 executing call #%d n=%d", call_count, n);
-            ++call_count;
-        }
-        float sum_sq = 0;
-        for (int i = 0; i < n; ++i) {
-            float v = bfloat16(src[i]).fp32();
-            sum_sq += v * v;
-        }
-        float rms = std::sqrt(sum_sq / n + eps);
-        for (int i = 0; i < n; ++i) {
-            float v = bfloat16(src[i]).fp32();
-            dst[i] = bfloat16((v / rms) * gamma[i]).data;
-        }
-    }
 
     static inline void bf16_vec_to_fp32(const unsigned short *src, float *dst, int n)
     {
@@ -407,14 +283,6 @@
         const int cp_top_k = _attr.cp_top_k;
         const float cp_top_p = _attr.cp_top_p;
 
-        // ---- Debug dump setup for CP validation (L2) ----
-        const bool cp_dump_enabled = !debug_dump_dir_.empty();
-        std::string cp_dump_dir;
-        if (cp_dump_enabled) {
-            cp_dump_dir = debug_dump_dir_.back() == '/' ? debug_dump_dir_ : debug_dump_dir_ + "/";
-            cp_dump_dir += "cpp_cp_dump/";
-            std::filesystem::create_directories(cp_dump_dir);
-        }
 
         for (int j = 0; j < 15; ++j)
         {
@@ -463,17 +331,6 @@
                 memcpy(embed_tmp.data(), cp_ctx.data() + (cp_ctx.size() - D), D * sizeof(unsigned short));
             }
 
-            // ---- Debug dump: CP prefill input embeds (L2-1) ----
-            if (cp_dump_enabled && is_prefill) {
-                std::string path = cp_dump_dir + "cpp_cp_frame_" + std::to_string(frame_idx) + "_input_embeds.bin";
-                FILE *fp = fopen(path.c_str(), "wb");
-                if (fp) {
-                    std::vector<float> buf(seq_len * D);
-                    for (int i = 0; i < seq_len * D; ++i) buf[i] = bfloat16(embed_tmp[i]).fp32();
-                    fwrite(buf.data(), sizeof(float), buf.size(), fp);
-                    fclose(fp);
-                }
-            }
 
             // run CP 5 layers
             for (int m = 0; m < 5; ++m)
@@ -541,19 +398,6 @@
             std::vector<unsigned short> hidden_step(D);
             memcpy(hidden_step.data(), embed_tmp.data() + (seq_len - 1) * D, D * sizeof(unsigned short));
 
-            // ---- Debug dump: CP hidden pre-norm (L2-2) ----
-            if (cp_dump_enabled) {
-                char path[1024];
-                snprintf(path, sizeof(path), "%s/cpp_cp_frame_%03d_hidden_pre_norm_%03d.bin",
-                         cp_dump_dir.c_str(), frame_idx, j);
-                FILE *fp = fopen(path, "wb");
-                if (fp) {
-                    std::vector<float> buf(D);
-                    for (int d = 0; d < D; ++d) buf[d] = bfloat16(hidden_step[d]).fp32();
-                    fwrite(buf.data(), sizeof(float), D, fp);
-                    fclose(fp);
-                }
-            }
 
             // run CP post
             {
@@ -571,19 +415,6 @@
                 }
             }
 
-            // ---- Debug dump: CP hidden post-norm (L2-3) ----
-            if (cp_dump_enabled) {
-                char path[1024];
-                snprintf(path, sizeof(path), "%s/cpp_cp_frame_%03d_hidden_post_norm_%03d.bin",
-                         cp_dump_dir.c_str(), frame_idx, j);
-                FILE *fp = fopen(path, "wb");
-                if (fp) {
-                    std::vector<float> buf(D);
-                    for (int d = 0; d < D; ++d) buf[d] = bfloat16(hidden_step[d]).fp32();
-                    fwrite(buf.data(), sizeof(float), D, fp);
-                    fclose(fp);
-                }
-            }
 
             // run lm_head_j -> logits [2048]
             auto &lmh = cp_lm_heads[j];
@@ -609,25 +440,6 @@
                 int res_code = CpSampleFromLogits(logits_fp32, 0.0f, 0, 1.0f);
                 out_frame_codes[j + 1] = res_code;
 
-                // ---- Debug dump: CP lm_head logits and sampled token (L2-4, L2-5) ----
-                if (cp_dump_enabled) {
-                    char path[1024];
-                    snprintf(path, sizeof(path), "%s/cpp_cp_frame_%03d_lm_head_%03d_logits.bin",
-                             cp_dump_dir.c_str(), frame_idx, j);
-                    FILE *fp = fopen(path, "wb");
-                    if (fp) {
-                        fwrite(logits_fp32.data(), sizeof(float), logits_n, fp);
-                        fclose(fp);
-                    }
-                    snprintf(path, sizeof(path), "%s/cpp_cp_frame_%03d_sampled_token_%03d.bin",
-                             cp_dump_dir.c_str(), frame_idx, j);
-                    fp = fopen(path, "wb");
-                    if (fp) {
-                        int32_t tok = res_code;
-                        fwrite(&tok, sizeof(int32_t), 1, fp);
-                        fclose(fp);
-                    }
-                }
 
                 // lookup residual embed
                 std::vector<unsigned short> res_embed(D);
@@ -648,19 +460,6 @@
         // Convert fp32 codec_sum back to bf16 (single truncation, matching Python torch.sum)
         for (int d = 0; d < D; ++d) out_codec_sum_bf16[d] = bfloat16(codec_sum_fp32[d]).data;
 
-        // ---- Debug dump: CP codec_sum for this frame (L2-6) ----
-        if (cp_dump_enabled) {
-            char path[1024];
-            snprintf(path, sizeof(path), "%s/cpp_cp_frame_%03d_codec_sum.bin",
-                     cp_dump_dir.c_str(), frame_idx);
-            FILE *fp = fopen(path, "wb");
-            if (fp) {
-                std::vector<float> buf(D);
-                for (int d = 0; d < D; ++d) buf[d] = bfloat16(out_codec_sum_bf16[d]).fp32();
-                fwrite(buf.data(), sizeof(float), D, fp);
-                fclose(fp);
-            }
-        }
 
         return true;
     }
@@ -700,7 +499,6 @@
         int input_embed_num = (int)(prefill_embeds.size() / _attr.tokens_embed_size);
         for (int i = 0; i < input_embed_num && i < (int)mask.size(); i++) mask[(size_t)i] = 0;
         int prefill_split_num = (int)ceil((double)input_embed_num / _attr.prefill_token_num);
-        ALOGI("RunTts input_embed_num=%d prefill_split_num=%d", input_embed_num, prefill_split_num);
 
         // prefill group selection
         std::vector<int> prefill_grp_list;
@@ -837,47 +635,7 @@
                 memcpy(embed.data(), embed_tmp.data() + (input_num_token - 1) * _attr.tokens_embed_size, _attr.tokens_embed_size * sizeof(unsigned short));
         }
 
-        // ---- Apply RMSNorm to all_prefill_hidden (align with Python normed hidden) ----
-        if (rmsnorm_onnx_loaded || !cp_norm_gamma.empty()) {
-            RunOnnxRmsNorm(all_prefill_hidden.data(), all_prefill_hidden.data(),
-                           input_embed_num, _attr.tokens_embed_size);
-            ALOGI("RunTts applied RMSNorm to all_prefill_hidden (%d tokens)", input_embed_num);
-        }
 
-        // ---- Debug dump: KV cache (after prefill, from decode group) ----
-        if (!debug_dump_dir_.empty())
-        {
-            std::string dir = debug_dump_dir_.back() == '/' ? debug_dump_dir_ : debug_dump_dir_ + "/";
-            std::string kvcache_dir = dir + "debug_talker_kvcache_ax";
-            std::filesystem::create_directories(kvcache_dir);
-            for (int m = 0; m < _attr.axmodel_num; m++)
-            {
-                auto &lyr = llama_layers[m];
-                int devid = LLM_DEVID(lyr);
-                auto &t_k = lyr.layer.get_input(decode_grpid, "K_cache");
-                auto &t_v = lyr.layer.get_input(decode_grpid, "V_cache");
-                size_t valid_kv_bytes = (size_t)input_embed_num * _attr.kv_cache_size * sizeof(unsigned short);
-
-                std::vector<unsigned short> k_bf16((size_t)input_embed_num * _attr.kv_cache_size);
-                std::vector<unsigned short> v_bf16((size_t)input_embed_num * _attr.kv_cache_size);
-                llm_d2h(k_bf16.data(), LLM_RADDR(t_k), valid_kv_bytes, devid);
-                llm_d2h(v_bf16.data(), LLM_RADDR(t_v), valid_kv_bytes, devid);
-
-                std::vector<float> k_fp32(k_bf16.size());
-                std::vector<float> v_fp32(v_bf16.size());
-                for (size_t i = 0; i < k_bf16.size(); ++i) k_fp32[i] = bfloat16(k_bf16[i]).fp32();
-                for (size_t i = 0; i < v_bf16.size(); ++i) v_fp32[i] = bfloat16(v_bf16[i]).fp32();
-
-                char path[1024];
-                snprintf(path, sizeof(path), "%s/layer_%02d_k.bin", kvcache_dir.c_str(), m);
-                FILE *fp = fopen(path, "wb");
-                if (fp) { fwrite(k_fp32.data(), sizeof(float), k_fp32.size(), fp); fclose(fp); }
-                snprintf(path, sizeof(path), "%s/layer_%02d_v.bin", kvcache_dir.c_str(), m);
-                fp = fopen(path, "wb");
-                if (fp) { fwrite(v_fp32.data(), sizeof(float), v_fp32.size(), fp); fclose(fp); }
-            }
-            ALOGI("[DEBUG] Saved AX KV cache -> %s", kvcache_dir.c_str());
-        }
 
         // ---- First post-process ----
         int next_token = -1;
@@ -890,116 +648,13 @@
             unsigned short *post_out = (unsigned short *)t_out.pVirAddr;
             next_token = post_process(postprocess, post_out, _attr.tokens_embed_num, token_ids, nullptr);
             token_ids.push_back(next_token);
-            ALOGI("RunTts first primary_code=%d", next_token);
         }
 
-        // ---- Debug dump: prefill last_hidden & logits ----
-        if (!debug_dump_dir_.empty())
-        {
-            std::string dir = debug_dump_dir_.back() == '/' ? debug_dump_dir_ : debug_dump_dir_ + "/";
-            // Save last raw hidden state (pre-RMSNorm, align with Python prefill_last_raw_hidden.bin)
-            {
-                std::string path = dir + "debug_talker_prefill_last_hidden_ax.bin";
-                FILE *fp = fopen(path.c_str(), "wb");
-                if (fp) {
-                    std::vector<float> buf(_attr.tokens_embed_size);
-                    for (int d = 0; d < _attr.tokens_embed_size; ++d) buf[d] = bfloat16(embed[d]).fp32();
-                    fwrite(buf.data(), sizeof(float), buf.size(), fp);
-                    fclose(fp);
-                    ALOGI("[DEBUG] Saved AX prefill last_raw_hidden -> %s", path.c_str());
-                }
-            }
-            // Save last normed hidden state (post-RMSNorm, align with Python prefill_last_normed_hidden.bin)
-            {
-                std::string path = dir + "prefill_last_normed_hidden_ax.bin";
-                FILE *fp = fopen(path.c_str(), "wb");
-                if (fp) {
-                    std::vector<float> buf(_attr.tokens_embed_size);
-                    int last_idx = input_embed_num - 1;
-                    for (int d = 0; d < _attr.tokens_embed_size; ++d) {
-                        buf[d] = bfloat16(all_prefill_hidden[(size_t)last_idx * _attr.tokens_embed_size + d]).fp32();
-                    }
-                    fwrite(buf.data(), sizeof(float), buf.size(), fp);
-                    fclose(fp);
-                    ALOGI("[DEBUG] Saved AX prefill last_normed_hidden -> %s", path.c_str());
-                }
-            }
-            // Save prefill logits (post_out of last token) as FP32
-            {
-                std::string path = dir + "debug_talker_prefill_logits_ax.bin";
-                FILE *fp = fopen(path.c_str(), "wb");
-                if (fp) {
-                    auto &t_out = llama_post.get_output("output");
-                    unsigned short *post_out = (unsigned short *)t_out.pVirAddr;
-                    std::vector<float> buf(_attr.tokens_embed_num);
-                    for (int d = 0; d < _attr.tokens_embed_num; ++d) buf[d] = bfloat16(post_out[d]).fp32();
-                    fwrite(buf.data(), sizeof(float), buf.size(), fp);
-                    fclose(fp);
-                    ALOGI("[DEBUG] Saved AX prefill logits -> %s", path.c_str());
-                }
-            }
-        }
 
         // ---- Decode loop with CP ----
         int step = 0;
         timer t_cost; t_cost.start();
         unsigned int decode_start = (unsigned int)input_embed_num;
-        // Diagnostic: log decode indices / mask tensor shape + is_linear_layer status
-        {
-            auto &t_idx0 = llama_layers[0].layer.get_input(decode_grpid, "indices");
-            auto &t_mask0 = llama_layers[0].layer.get_input(decode_grpid, "mask");
-            ALOGI("[diag] talker decode indices nSize=%d (elems=%d)  mask nSize=%d (elems=%d, host mask elems=%zu)",
-                  t_idx0.nSize, (int)(t_idx0.nSize / sizeof(unsigned int)),
-                  t_mask0.nSize, (int)(t_mask0.nSize / sizeof(unsigned short)), mask.size());
-            // Per-layer K_cache / V_cache shape + is_linear_layer status
-            int linear_count = 0;
-            for (int m = 0; m < _attr.axmodel_num; ++m) {
-                auto &tk_dec = llama_layers[m].layer.get_input(decode_grpid, "K_cache");
-                bool islin = is_linear_layer(m);
-                if (islin) ++linear_count;
-                if (m < 4 || m == _attr.axmodel_num - 1 || islin) {
-                    ALOGI("[diag] talker layer %02d: decode K_cache nSize=%d, is_linear=%d", m, tk_dec.nSize, (int)islin);
-                }
-            }
-            ALOGI("[diag] talker layers: total=%d, is_linear_count=%d, full_attention_interval=%d",
-                  _attr.axmodel_num, linear_count, _attr.full_attention_interval);
-            // Per-prefill-group pre_k sizes (to spot d2d overrun)
-            for (size_t gi = 0; gi < prefill_grpids_.size(); ++gi) {
-                int gid = prefill_grpids_[(size_t)gi];
-                auto &pre_k_g = llama_layers[0].layer.get_input(gid, "K_cache");
-                auto &out_k_g = llama_layers[0].layer.get_output(gid, "K_cache_out");
-                ALOGI("[diag] talker prefill gid=%d  pre_k.nSize=%d  out_k.nSize=%d  (kv_cap=%d)",
-                      gid, pre_k_g.nSize, out_k_g.nSize, prefill_capacity_by_gid(gid));
-            }
-            if (cp_loaded) {
-                auto &cp_idx0 = cp_layers[0].layer.get_input(cp_prefill_gid, "indices");
-                ALOGI("[diag] cp prefill_gid indices nSize=%d (elems=%d)",
-                      cp_idx0.nSize, (int)(cp_idx0.nSize / sizeof(unsigned int)));
-                if (cp_decode_gid >= 0) {
-                    auto &cp_idx1 = cp_layers[0].layer.get_input(cp_decode_gid, "indices");
-                    ALOGI("[diag] cp decode_gid indices nSize=%d (elems=%d)",
-                          cp_idx1.nSize, (int)(cp_idx1.nSize / sizeof(unsigned int)));
-                }
-            }
-        }
-        // Helper lambda: print fp32 stats of a bf16 vector (for codec_sum / next_embed / embed)
-        auto diag_bf16_stats = [&](const char *tag, int frame_idx, const unsigned short *p, int n) {
-            double sum = 0, sumsq = 0, sumabs = 0;
-            float mn = 1e30f, mx = -1e30f;
-            for (int i = 0; i < n; ++i) {
-                float v = bfloat16(p[i]).fp32();
-                sum += v; sumsq += (double)v * v; sumabs += std::abs(v);
-                if (v < mn) mn = v;
-                if (v > mx) mx = v;
-            }
-            double mean = sum / n;
-            double l2 = std::sqrt(sumsq);
-            ALOGI("[diag] %s frame=%d  mean=%.5f  L2=%.4f  L1=%.4f  min=%.4f  max=%.4f  first5=[%.4f %.4f %.4f %.4f %.4f]",
-                  tag, frame_idx, mean, l2, sumabs, (double)mn, (double)mx,
-                  (double)bfloat16(p[0]).fp32(), (double)bfloat16(p[1]).fp32(),
-                  (double)bfloat16(p[2]).fp32(), (double)bfloat16(p[3]).fp32(),
-                  (double)bfloat16(p[4]).fp32());
-        };
         for (unsigned int indices = decode_start; indices < (unsigned int)_attr.max_token_len; indices++)
         {
             if (b_stop.load(std::memory_order_relaxed)) break;
@@ -1023,12 +678,8 @@
                        all_prefill_hidden.data() + (size_t)(input_embed_num - 1) * _attr.tokens_embed_size,
                        _attr.tokens_embed_size * sizeof(unsigned short));
             } else {
-                // Subsequent frames: use normed talker decode output
-                if (rmsnorm_onnx_loaded || !cp_norm_gamma.empty()) {
-                    RunOnnxRmsNorm(txt_hidden_bf16.data(), embed.data(), 1, _attr.tokens_embed_size);
-                } else {
-                    memcpy(txt_hidden_bf16.data(), embed.data(), _attr.tokens_embed_size * sizeof(unsigned short));
-                }
+                // Subsequent frames: use talker decode output directly (RMSNorm merged into axmodel)
+                memcpy(txt_hidden_bf16.data(), embed.data(), _attr.tokens_embed_size * sizeof(unsigned short));
             }
             bool cp_ok = false;
             if (cp_callback) {
@@ -1040,10 +691,6 @@
             {
                 ALOGE("RunCpFrame failed at step %d", step);
                 break;
-            }
-            if (step < 2) {
-                diag_bf16_stats("txt_hidden_in", step, txt_hidden_bf16.data(), _attr.tokens_embed_size);
-                diag_bf16_stats("codec_sum    ", step, codec_sum_bf16.data(), _attr.tokens_embed_size);
             }
             // print frame
             printf("frame=%d %d", step, primary_code);
@@ -1084,45 +731,7 @@
                     next_embed[d] = bfloat16(a + b).data;
                 }
             }
-            if (step < 2) {
-                diag_bf16_stats("tts_pad_vec  ", step, tts_pad_vec_bf16.data(), _attr.tokens_embed_size);
-                diag_bf16_stats("next_embed   ", step, next_embed.data(), _attr.tokens_embed_size);
-            }
 
-            // ---- Debug dump: Talker decode inputs (L3-1 ~ L3-3) ----
-            if (!debug_dump_dir_.empty()) {
-                std::string dir = debug_dump_dir_.back() == '/' ? debug_dump_dir_ : debug_dump_dir_ + "/";
-                char path[1024];
-                auto dump_fp32 = [&](const char *name, const std::vector<unsigned short> &vec) {
-                    snprintf(path, sizeof(path), "%scpp_talker_decode_step%03d_%s.bin", dir.c_str(), step, name);
-                    FILE *fp = fopen(path, "wb");
-                    if (fp) {
-                        std::vector<float> buf(vec.size());
-                        for (size_t i = 0; i < vec.size(); ++i) buf[i] = bfloat16(vec[i]).fp32();
-                        fwrite(buf.data(), sizeof(float), buf.size(), fp);
-                        fclose(fp);
-                    }
-                };
-                dump_fp32("codec_sum", codec_sum_bf16);
-                dump_fp32("inputs_embeds", next_embed);
-                // dump decode indices (uint32 -> fp32 for easy numpy comparison)
-                snprintf(path, sizeof(path), "%scpp_talker_decode_step%03d_indices.bin", dir.c_str(), step);
-                FILE *fp_idx = fopen(path, "wb");
-                if (fp_idx) {
-                    float idx_val = static_cast<float>(indices);
-                    fwrite(&idx_val, sizeof(float), 1, fp_idx);
-                    fclose(fp_idx);
-                }
-                // dump decode mask (bf16 -> fp32)
-                snprintf(path, sizeof(path), "%scpp_talker_decode_step%03d_mask.bin", dir.c_str(), step);
-                FILE *fp_mask = fopen(path, "wb");
-                if (fp_mask) {
-                    std::vector<float> mask_buf(mask.size());
-                    for (size_t i = 0; i < mask.size(); ++i) mask_buf[i] = bfloat16(mask[i]).fp32();
-                    fwrite(mask_buf.data(), sizeof(float), mask_buf.size(), fp_mask);
-                    fclose(fp_mask);
-                }
-            }
 
             // 3. Talker decode step
             {
@@ -1176,21 +785,6 @@
                     llm_d2d((unsigned short *)LLM_WADDR(in_v) + indices * _attr.kv_cache_size, LLM_RADDR(out_v), out_v.nSize, devid);
                 }
                 auto &cur_out = lyr.layer.get_output(decode_grpid, "output");
-                // ---- Debug dump: all layer outputs for step 0 ----
-                if (step == 0 && !debug_dump_dir_.empty()) {
-                    std::string dir = debug_dump_dir_.back() == '/' ? debug_dump_dir_ : debug_dump_dir_ + "/";
-                    char path[1024];
-                    snprintf(path, sizeof(path), "%scpp_talker_decode_step%03d_layer%02d_output.bin", dir.c_str(), step, m);
-                    FILE *fp = fopen(path, "wb");
-                    if (fp) {
-                        std::vector<unsigned short> l_out_bf16(_attr.tokens_embed_size);
-                        llm_d2h(l_out_bf16.data(), LLM_RADDR(cur_out), l_out_bf16.size() * sizeof(unsigned short), devid);
-                        std::vector<float> buf(_attr.tokens_embed_size);
-                        for (int d = 0; d < _attr.tokens_embed_size; ++d) buf[d] = bfloat16(l_out_bf16[d]).fp32();
-                        fwrite(buf.data(), sizeof(float), buf.size(), fp);
-                        fclose(fp);
-                    }
-                }
                 if (m == _attr.axmodel_num - 1)
                 {
                     auto &post_in = llama_post.get_input("input");
@@ -1256,70 +850,16 @@
                     memcpy(in_v_ptr + indices * _attr.kv_cache_size, out_v.pVirAddr, sizeof(unsigned short) * _attr.kv_cache_size);
                 }
                 auto &t_out = lyr.layer.get_output(decode_grpid, "output"); memcpy(embed.data(), t_out.pVirAddr, embed.size() * sizeof(unsigned short));
-                // ---- Debug dump: all layer outputs for step 0 ----
-                if (step == 0 && !debug_dump_dir_.empty()) {
-                    std::string dir = debug_dump_dir_.back() == '/' ? debug_dump_dir_ : debug_dump_dir_ + "/";
-                    char path[1024];
-                    snprintf(path, sizeof(path), "%scpp_talker_decode_step%03d_layer%02d_output.bin", dir.c_str(), step, m);
-                    FILE *fp = fopen(path, "wb");
-                    if (fp) {
-                        std::vector<float> buf(_attr.tokens_embed_size);
-                        for (int d = 0; d < _attr.tokens_embed_size; ++d) buf[d] = bfloat16(((unsigned short *)t_out.pVirAddr)[d]).fp32();
-                        fwrite(buf.data(), sizeof(float), buf.size(), fp);
-                        fclose(fp);
-                    }
-                }
             }
             auto &t_in = llama_post.get_input("input"); memcpy(t_in.pVirAddr, embed.data(), embed.size() * sizeof(unsigned short));
             llama_post.inference(); auto &t_out = llama_post.get_output("output");
             unsigned short *post_out = (unsigned short *)t_out.pVirAddr; next_token = post_process(postprocess, post_out, _attr.tokens_embed_num, token_ids, nullptr);
 #endif
 
-            // ---- Debug dump: Talker decode outputs (L3-4 ~ L3-6) ----
-            if (!debug_dump_dir_.empty()) {
-                std::string dir = debug_dump_dir_.back() == '/' ? debug_dump_dir_ : debug_dump_dir_ + "/";
-                char path[1024];
-                // raw hidden
-                snprintf(path, sizeof(path), "%scpp_talker_decode_step%03d_raw_hidden.bin", dir.c_str(), step);
-                FILE *fp = fopen(path, "wb");
-                if (fp) {
-                    std::vector<float> buf(_attr.tokens_embed_size);
-                    for (int d = 0; d < _attr.tokens_embed_size; ++d) buf[d] = bfloat16(embed[d]).fp32();
-                    fwrite(buf.data(), sizeof(float), buf.size(), fp);
-                    fclose(fp);
-                }
-                // logits from post head
-                {
-                    auto &t_out = llama_post.get_output("output");
-                    unsigned short *post_ptr = (unsigned short *)t_out.pVirAddr;
-                    int logits_n = (int)(t_out.nSize / sizeof(unsigned short));
-                    if (logits_n > _attr.tokens_embed_num) logits_n = _attr.tokens_embed_num;
-                    snprintf(path, sizeof(path), "%scpp_talker_decode_step%03d_logits.bin", dir.c_str(), step);
-                    fp = fopen(path, "wb");
-                    if (fp) {
-                        std::vector<float> buf(logits_n);
-                        for (int i = 0; i < logits_n; ++i) buf[i] = bfloat16(post_ptr[i]).fp32();
-                        fwrite(buf.data(), sizeof(float), buf.size(), fp);
-                        fclose(fp);
-                    }
-                }
-                // next token
-                snprintf(path, sizeof(path), "%scpp_talker_decode_step%03d_next_token.bin", dir.c_str(), step);
-                fp = fopen(path, "wb");
-                if (fp) {
-                    int32_t tok = next_token;
-                    fwrite(&tok, sizeof(int32_t), 1, fp);
-                    fclose(fp);
-                }
-            }
 
             if (indices < mask.size()) mask[indices] = 0;
             token_ids.push_back(next_token);
 
-            if (step < 2) {
-                diag_bf16_stats("decode_raw_h ", step, embed.data(), _attr.tokens_embed_size);
-                ALOGI("[diag] step=%d  next_primary=%d", step, next_token);
-            }
 
             // save frame
             TtsFrame frame;
