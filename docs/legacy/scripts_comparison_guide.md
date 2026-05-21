@@ -16,6 +16,7 @@
 | `compare_cp_dumps.py` | L2 | CP (Code Predictor) 独立一致性 | CP 单步验证 |
 | `compare_coupling_flow.py` | L3 | Talker-CP 耦合流（codec_sum / inputs_embeds / residual） | decode 发散排查 |
 | `compare_talker_decode_full.py` | L3 | Talker decode 每步全量（codec_sum / inputs / hidden / logits / token） | end-to-end 验证 |
+| `compare_talker_decode_inputs.py` | L3 | Talker decode **输入状态**（KV cache / indices / mask） | decode raw_hidden 发散根因排查 |
 | `compare_talker_kvcache.py` | - | AX vs ONNX KV cache 层间对比 | KV cache 精度排查 |
 
 ---
@@ -260,6 +261,86 @@ python_talker_decode_step{NNN}_inputs_embeds.bin
 
 **作用**：**L3 end-to-end 验证** —— 逐帧对比 Talker decode 的全部输出：codec_sum、inputs_embeds、raw_hidden、logits、next_token。
 
+---
+
+## 7. `compare_talker_decode_inputs.py` ⭐新增
+
+**作用**：**L3 输入状态验证** —— 在 `compare_talker_decode_full.py` 发现 `raw_hidden` 发散后，进一步 dump 并对比 Talker decode step 0 的四个内部输入，定位根因。
+
+**对比项**：
+1. `k_cache_l00` —— prefill 后 layer 0 的 K cache
+2. `v_cache_l00` —— prefill 后 layer 0 的 V cache
+3. `indices` —— decode 时传入的 position index
+4. `mask` —— decode 时传入的 attention mask
+
+**参数**：
+
+```bash
+python3 scripts/compare_talker_decode_inputs.py \
+    --cpp-dir ./debug_bin/cpp_dump \
+    --py-dir ./debug_bin/py_dump \
+    [--step 0] \
+    [-v]
+```
+
+- `--cpp-dir` / `--py-dir`：C++ / Python dump 目录
+- `--step`：要对比的 decode step（默认 0，即第一个 decode step）
+- `-v`：verbose，打印首个差异索引
+
+**期望输入文件结构**：
+
+```
+cpp_dir/
+  debug_talker_kvcache_ax/
+    layer_00_k.bin          # prefill 后 layer 0 K cache
+    layer_00_v.bin          # prefill 后 layer 0 V cache
+  cpp_talker_decode_step000_indices.bin
+  cpp_talker_decode_step000_mask.bin
+
+py_dir/
+  python_talker_decode/
+    python_talker_decode_step000_k_cache_l00.bin
+    python_talker_decode_step000_v_cache_l00.bin
+    python_talker_decode_step000_indices.bin
+    python_talker_decode_step000_mask.bin
+```
+
+**输出示例**：
+
+```
+=== Talker Decode Inputs Comparison (step 0) ===
+  [k_cache_l00] cos=1.000000 max_diff=0.000000 mean_diff=0.000000 MATCH
+  [v_cache_l00] cos=1.000000 max_diff=0.000000 mean_diff=0.000000 MATCH
+  [indices]     cos=1.000000 max_diff=0.000000 mean_diff=0.000000 MATCH
+  [mask]        cos=1.000000 max_diff=0.000000 mean_diff=0.000000 MATCH
+
+============================================================
+Summary
+============================================================
+✅ All decode inputs MATCH
+
+→ 问题在 axmodel 内部（层间 buffer、device 状态等）
+→ 需 dump 逐层中间输出（layer0 output, layer1 input...）
+```
+
+**判定树**：
+
+```
+对比 decode step 0 输入
+    ├── K_cache / V_cache 不一致
+    │       → 检查 prefill 后 state 的保存逻辑
+    │       → 检查 C++ prefill KV cache 更新位置 vs Python
+    ├── indices 不一致
+    │       → 检查 _last_static_position_id() 返回值 vs C++ decode_start
+    │       → 检查 position_ids / cache_position 传递链条
+    ├── mask 不一致
+    │       → 检查 _build_decode_mask_cache() 的 fp32 数值 vs C++ mask vector
+    │       → 特别关注最后一个元素是否为 0
+    └── 四个输入全部一致
+            → 说明问题在 axmodel 内部（层间 buffer、device 状态等）
+            → 需 dump 逐层中间输出（layer0 output, layer1 input...）
+```
+
 **参数**：
 
 ```bash
@@ -312,7 +393,7 @@ Summary
 
 ---
 
-## 7. `compare_talker_kvcache.py`
+## 8. `compare_talker_kvcache.py`
 
 **作用**：层间对比 AX Talker 与 ONNX Talker 的 **KV cache**（每层的 K 和 V）。用于排查特定层的 KV cache 偏差。
 
@@ -345,7 +426,7 @@ Layer 15 K: cos=0.999800 max_diff=0.001200 ⚠️
 
 ---
 
-## 8. 推荐验证流程
+## 9. 推荐验证流程
 
 ```
 Step 1: L0 Prefill 输入
@@ -367,11 +448,15 @@ Step 4: L3 Talker+CP 耦合
 Step 5: L3 Decode 全量
   → compare_talker_decode_full.py --cpp-dir ... --py-dir ... -v
   → 定位 first divergence step 和 field
+
+Step 6: L3 Decode 输入状态（当 raw_hidden 在 step 0 发散时）
+  → compare_talker_decode_inputs.py --cpp-dir ... --py-dir ... --step 0 -v
+  → 判定根因：KV cache / indices / mask / axmodel 内部
 ```
 
 ---
 
-## 9. 文件名映射速查（C++ ↔ Python）
+## 10. 文件名映射速查（C++ ↔ Python）
 
 | 语义 | C++ 文件名 | Python 文件名 |
 |------|-----------|--------------|

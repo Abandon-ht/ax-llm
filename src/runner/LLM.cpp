@@ -23,6 +23,10 @@
 
 #include "vision/vision_module.hpp"
 
+#ifdef USE_ONNX_RMSNORM
+#include <onnxruntime_cxx_api.h>
+#endif
+
 #ifdef USE_AXCL
 #include "ax_model_runner/ax_model_runner_axcl.hpp"
 #include "utils/axcl_manager.h"
@@ -119,6 +123,20 @@ struct LLM::Impl {
     // Talker post-norm gamma for CP input (fp32, [hidden_size])
     std::vector<float> cp_norm_gamma;
 
+    // ONNX Runtime RMSNorm session (optional, replaces rmsnorm_bf16)
+#ifdef USE_ONNX_RMSNORM
+    std::unique_ptr<Ort::Env> ort_env;
+    std::unique_ptr<Ort::Session> rmsnorm_session;
+    std::unique_ptr<Ort::MemoryInfo> ort_memory_info;
+    std::vector<const char*> ort_input_names;
+    std::vector<const char*> ort_output_names;
+    std::vector<std::string> ort_input_strings_;
+    std::vector<std::string> ort_output_strings_;
+    bool rmsnorm_onnx_loaded = false;
+#else
+    bool rmsnorm_onnx_loaded = false;
+#endif
+
     // Debug dump directory
     std::string debug_dump_dir_;
 
@@ -164,6 +182,56 @@ struct LLM::Impl {
         }
         return embedding;
     }
+
+    // ONNX Runtime RMSNorm inference helper.
+    // src/dst: bf16 arrays of shape [token_count * hidden_size].
+#ifdef USE_ONNX_RMSNORM
+    void RunOnnxRmsNorm(unsigned short *dst, const unsigned short *src,
+                        int token_count, int hidden_size)
+    {
+        ALOGI("[RNE_FIX] RunOnnxRmsNorm ONNX path: tokens=%d hidden=%d", token_count, hidden_size);
+        if (!rmsnorm_onnx_loaded || !rmsnorm_session) {
+            ALOGE("[RNE_FIX] FATAL: ONNX RMSNorm not available!");
+            return;
+        }
+        try {
+            // bf16 -> fp32
+            ALOGI("[RNE_FIX] ONNX converting bf16->fp32, elems=%d", token_count * hidden_size);
+            std::vector<float> input_fp32((size_t)token_count * hidden_size);
+            for (int i = 0; i < token_count * hidden_size; ++i) {
+                unsigned int u = ((unsigned int)src[i]) << 16;
+                input_fp32[i] = *reinterpret_cast<float *>(&u);
+            }
+            // Create input tensor [1, token_count, hidden_size]
+            std::vector<int64_t> input_shape = {1, token_count, hidden_size};
+            Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
+                *ort_memory_info, input_fp32.data(), input_fp32.size(),
+                input_shape.data(), input_shape.size());
+            // Run ONNX inference
+            Ort::RunOptions run_options;
+            ALOGI("[RNE_FIX] ONNX Run START");
+            std::vector<Ort::Value> output_tensors = rmsnorm_session->Run(
+                run_options,
+                ort_input_names.data(), &input_tensor, 1,
+                ort_output_names.data(), 1);
+            ALOGI("[RNE_FIX] ONNX Run DONE");
+            // fp32 -> bf16
+            float *output_fp32 = output_tensors[0].GetTensorMutableData<float>();
+            for (int i = 0; i < token_count * hidden_size; ++i) {
+                dst[i] = bfloat16(output_fp32[i]).data;
+            }
+            ALOGI("[RNE_FIX] ONNX output converted back to bf16, DONE");
+        } catch (const Ort::Exception &e) {
+            ALOGE("[RNE_FIX] ONNX RMSNorm inference failed: %s", e.what());
+        }
+    }
+#else
+    void RunOnnxRmsNorm(unsigned short *dst, const unsigned short *src,
+                        int token_count, int hidden_size)
+    {
+        ALOGE("[RNE_FIX] FATAL: USE_ONNX_RMSNORM not defined!");
+    }
+#endif
 
     static inline int tolower_uc(int c) { return std::tolower((unsigned char)c); }
 

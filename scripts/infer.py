@@ -647,6 +647,29 @@ class StaticTalkerLayerRunner:
 
         decode_mask = self.decode_mask_cache[state.current_len]
         decode_indices = np.array([[state.current_len if position_index is None else int(position_index)]], dtype=np.uint32)
+
+        # ---- Debug dump: Talker decode inputs (step 0 KV cache / indices / mask) ----
+        import os
+        _dump_dir = os.environ.get("QWEN3_TTS_DUMP_DIR")
+        if _dump_dir:
+            step_dir = Path(_dump_dir) / "python_talker_decode"
+            step_dir.mkdir(parents=True, exist_ok=True)
+            step = state.current_len - state.prompt_len  # decode step index
+            # 1. KV cache (layer 0 only, valid prefix up to current_len)
+            state.k_caches[0][:, :state.current_len, :].astype(np.float32).tofile(
+                step_dir / f"python_talker_decode_step{step:03d}_k_cache_l00.bin"
+            )
+            state.v_caches[0][:, :state.current_len, :].astype(np.float32).tofile(
+                step_dir / f"python_talker_decode_step{step:03d}_v_cache_l00.bin"
+            )
+            # 2. indices
+            decode_indices.astype(np.float32).tofile(
+                step_dir / f"python_talker_decode_step{step:03d}_indices.bin"
+            )
+            # 3. mask
+            decode_mask.astype(np.float32).tofile(
+                step_dir / f"python_talker_decode_step{step:03d}_mask.bin"
+            )
         for layer_idx, session in enumerate(self.layer_sessions):
             if self.log_progress:
                 print(
@@ -668,6 +691,12 @@ class StaticTalkerLayerRunner:
             state.k_caches[layer_idx][:, state.current_len, :] = outputs["K_cache_out"].reshape((1, self.kv_dim))
             state.v_caches[layer_idx][:, state.current_len, :] = outputs["V_cache_out"].reshape((1, self.kv_dim))
             data_decode = data_decode.astype(self.m_dtype)
+
+            # ---- Debug dump: all layer outputs for step 0 ----
+            if _dump_dir and step == 0:
+                data_decode.astype(np.float32).tofile(
+                    step_dir / f"python_talker_decode_step{step:03d}_layer{layer_idx:02d}_output.bin"
+                )
 
         state.current_len += 1
         return data_decode.astype(self.m_dtype)
@@ -695,9 +724,10 @@ def _build_axengine_talker_module(
     dump_audio_token_id: Optional[int] = None,
     dump_streaming: bool = False,
     codec_embedding_weight_path: Optional[Path] = None,
+    talker_rmsnorm_onnx_path: Optional[Path] = None,
 ):
     class _AxEngineQwen3TTSTalkerModel(torch_module.nn.Module):
-        def __init__(self):
+        def __init__(self, talker_rmsnorm_onnx_path=None):
             super().__init__()
             self.config = original_model.config
             if codec_embedding_weight_path is not None:
@@ -736,6 +766,20 @@ def _build_axengine_talker_module(
                 self.codec_embedding = original_model.get_input_embeddings()
             self.text_embedding = original_model.get_text_embeddings()
             self.norm = original_model.norm
+            self.rmsnorm_onnx_session = None
+            self.rmsnorm_onnx_path = talker_rmsnorm_onnx_path
+            if self.rmsnorm_onnx_path is not None and self.rmsnorm_onnx_path.exists():
+                try:
+                    import onnxruntime as ort
+                    self.rmsnorm_onnx_session = ort.InferenceSession(str(self.rmsnorm_onnx_path))
+                    print(
+                        f"[talker] Loaded ONNX RMSNorm from {self.rmsnorm_onnx_path}", flush=True
+                    )
+                except Exception as exc:
+                    print(
+                        f"[talker] WARNING: Failed to load ONNX RMSNorm from {self.rmsnorm_onnx_path}: {exc}",
+                        flush=True,
+                    )
             self.gradient_checkpointing = False
             self.runner = runner
             self.compare_frames = max(0, int(compare_frames))
@@ -852,6 +896,14 @@ def _build_axengine_talker_module(
             self.codec_embedding = value
 
         def _to_hidden_tensor(self, raw_hidden, device, dtype):
+            if self.rmsnorm_onnx_session is not None:
+                onnx_input = raw_hidden.astype(np.float32, copy=False)
+                if not onnx_input.flags["C_CONTIGUOUS"]:
+                    onnx_input = np.ascontiguousarray(onnx_input)
+                onnx_outputs = self.rmsnorm_onnx_session.run(None, {"hidden_states": onnx_input})
+                hidden_np = onnx_outputs[0]
+                hidden = torch_module.from_numpy(hidden_np).to(device=device, dtype=dtype)
+                return hidden
             hidden = torch_module.from_numpy(raw_hidden.astype(np.float32)).to(device=device, dtype=dtype)
             return self.norm(hidden)
 
@@ -985,7 +1037,7 @@ def _build_axengine_talker_module(
                 attentions=None,
             )
 
-    return _AxEngineQwen3TTSTalkerModel()
+    return _AxEngineQwen3TTSTalkerModel(talker_rmsnorm_onnx_path=talker_rmsnorm_onnx_path)
 
 
 def _build_axengine_talker_post_head(torch_module, axengine_talker_model):
@@ -1040,6 +1092,7 @@ def replace_talker_model(qwen_wrapper, args, torch_module):
         axengine_device=args.axengine_device,
     )
     compare_frames = int(getattr(args, "compare_talker_frames", 0))
+    talker_rmsnorm_onnx_path = Path(args.compiled_model_path) / "talker_rmsnorm.onnx"
     axengine_talker_model = _build_axengine_talker_module(
         torch_module,
         modeling_outputs,
@@ -1052,6 +1105,7 @@ def replace_talker_model(qwen_wrapper, args, torch_module):
         dump_audio_token_id=getattr(args, "dump_audio_token_id", None),
         dump_streaming=not getattr(args, "non_streaming_mode", False),
         codec_embedding_weight_path=getattr(args, "talker_codec_embedding_bin", None),
+        talker_rmsnorm_onnx_path=talker_rmsnorm_onnx_path,
     ).eval()
     talker.model = axengine_talker_model
     talker.codec_head = _build_axengine_talker_post_head(torch_module, axengine_talker_model).eval()

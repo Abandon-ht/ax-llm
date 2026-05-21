@@ -170,8 +170,9 @@
         }
 
         // Load talker norm gamma for CP input
+        std::string talker_dir;
         {
-            std::string talker_dir = (std::filesystem::path(cp_dir) / ".." / "talker").lexically_normal().string();
+            talker_dir = (std::filesystem::path(cp_dir) / ".." / "talker").lexically_normal().string();
             std::string norm_path = talker_dir + "/talker.model.norm.weight.bfloat16.bin";
             std::ifstream fin(norm_path, std::ios::binary | std::ios::ate);
             if (fin.is_open()) {
@@ -187,6 +188,47 @@
                 ALOGW("Cannot load talker norm gamma from %s, CP input will be unnormalized!", norm_path.c_str());
             }
         }
+
+        // Load ONNX Runtime RMSNorm session (optional)
+#ifdef USE_ONNX_RMSNORM
+        {
+            std::string onnx_path = talker_dir + "/talker_rmsnorm.onnx";
+            if (std::filesystem::exists(onnx_path)) {
+                try {
+                    ort_env.reset(new Ort::Env(ORT_LOGGING_LEVEL_WARNING, "talker_rmsnorm"));
+                    ort_memory_info.reset(new Ort::MemoryInfo(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)));
+                    Ort::SessionOptions session_options;
+                    session_options.SetIntraOpNumThreads(1);
+                    session_options.SetInterOpNumThreads(1);
+                    rmsnorm_session.reset(new Ort::Session(*ort_env, onnx_path.c_str(), session_options));
+                    // Query input/output names
+                    Ort::AllocatorWithDefaultOptions allocator;
+                    size_t num_inputs = rmsnorm_session->GetInputCount();
+                    size_t num_outputs = rmsnorm_session->GetOutputCount();
+                    if (num_inputs >= 1 && num_outputs >= 1) {
+                        Ort::AllocatedStringPtr input_name_ptr = rmsnorm_session->GetInputNameAllocated(0, allocator);
+                        Ort::AllocatedStringPtr output_name_ptr = rmsnorm_session->GetOutputNameAllocated(0, allocator);
+                        ort_input_names.push_back(input_name_ptr.get());
+                        ort_output_names.push_back(output_name_ptr.get());
+                        // Keep the strings alive by copying
+                        ort_input_strings_.push_back(std::string(input_name_ptr.get()));
+                        ort_output_strings_.push_back(std::string(output_name_ptr.get()));
+                        ort_input_names[0] = ort_input_strings_[0].c_str();
+                        ort_output_names[0] = ort_output_strings_[0].c_str();
+                        rmsnorm_onnx_loaded = true;
+                        ALOGI("Loaded ONNX RMSNorm from %s (in=%zu out=%zu)", onnx_path.c_str(), num_inputs, num_outputs);
+                    } else {
+                        ALOGE("ONNX RMSNorm model has unexpected in/out count");
+                    }
+                } catch (const Ort::Exception &e) {
+                    ALOGE("Failed to load ONNX RMSNorm from %s: %s", onnx_path.c_str(), e.what());
+                    rmsnorm_onnx_loaded = false;
+                }
+            } else {
+                ALOGW("ONNX RMSNorm not found at %s, using hand-written rmsnorm_bf16", onnx_path.c_str());
+            }
+        }
+#endif
 
         if (!_attr.post_config_path.empty() && std::filesystem::exists(_attr.post_config_path))
         {
@@ -218,6 +260,7 @@
         }
 
         cp_loaded = true;
+        ALOGI(">>> [RNE_FIX] bfloat16 round-to-nearest-even ENABLED <<<");
         return true;
     }
 
@@ -236,6 +279,11 @@
     static inline void rmsnorm_bf16(unsigned short *dst, const unsigned short *src,
                                      const float *gamma, int n, float eps=1e-6)
     {
+        static int call_count = 0;
+        if (call_count < 3) {
+            ALOGI("[RNE_FIX] rmsnorm_bf16 executing call #%d n=%d", call_count, n);
+            ++call_count;
+        }
         float sum_sq = 0;
         for (int i = 0; i < n; ++i) {
             float v = bfloat16(src[i]).fp32();
@@ -790,13 +838,9 @@
         }
 
         // ---- Apply RMSNorm to all_prefill_hidden (align with Python normed hidden) ----
-        if (!cp_norm_gamma.empty()) {
-            for (int t = 0; t < input_embed_num; ++t) {
-                rmsnorm_bf16(
-                    all_prefill_hidden.data() + (size_t)t * _attr.tokens_embed_size,
-                    all_prefill_hidden.data() + (size_t)t * _attr.tokens_embed_size,
-                    cp_norm_gamma.data(), _attr.tokens_embed_size);
-            }
+        if (rmsnorm_onnx_loaded || !cp_norm_gamma.empty()) {
+            RunOnnxRmsNorm(all_prefill_hidden.data(), all_prefill_hidden.data(),
+                           input_embed_num, _attr.tokens_embed_size);
             ALOGI("RunTts applied RMSNorm to all_prefill_hidden (%d tokens)", input_embed_num);
         }
 
@@ -980,8 +1024,8 @@
                        _attr.tokens_embed_size * sizeof(unsigned short));
             } else {
                 // Subsequent frames: use normed talker decode output
-                if (!cp_norm_gamma.empty()) {
-                    rmsnorm_bf16(txt_hidden_bf16.data(), embed.data(), cp_norm_gamma.data(), _attr.tokens_embed_size);
+                if (rmsnorm_onnx_loaded || !cp_norm_gamma.empty()) {
+                    RunOnnxRmsNorm(txt_hidden_bf16.data(), embed.data(), 1, _attr.tokens_embed_size);
                 } else {
                     memcpy(txt_hidden_bf16.data(), embed.data(), _attr.tokens_embed_size * sizeof(unsigned short));
                 }
@@ -1061,6 +1105,23 @@
                 };
                 dump_fp32("codec_sum", codec_sum_bf16);
                 dump_fp32("inputs_embeds", next_embed);
+                // dump decode indices (uint32 -> fp32 for easy numpy comparison)
+                snprintf(path, sizeof(path), "%scpp_talker_decode_step%03d_indices.bin", dir.c_str(), step);
+                FILE *fp_idx = fopen(path, "wb");
+                if (fp_idx) {
+                    float idx_val = static_cast<float>(indices);
+                    fwrite(&idx_val, sizeof(float), 1, fp_idx);
+                    fclose(fp_idx);
+                }
+                // dump decode mask (bf16 -> fp32)
+                snprintf(path, sizeof(path), "%scpp_talker_decode_step%03d_mask.bin", dir.c_str(), step);
+                FILE *fp_mask = fopen(path, "wb");
+                if (fp_mask) {
+                    std::vector<float> mask_buf(mask.size());
+                    for (size_t i = 0; i < mask.size(); ++i) mask_buf[i] = bfloat16(mask[i]).fp32();
+                    fwrite(mask_buf.data(), sizeof(float), mask_buf.size(), fp_mask);
+                    fclose(fp_mask);
+                }
             }
 
             // 3. Talker decode step
@@ -1115,6 +1176,21 @@
                     llm_d2d((unsigned short *)LLM_WADDR(in_v) + indices * _attr.kv_cache_size, LLM_RADDR(out_v), out_v.nSize, devid);
                 }
                 auto &cur_out = lyr.layer.get_output(decode_grpid, "output");
+                // ---- Debug dump: all layer outputs for step 0 ----
+                if (step == 0 && !debug_dump_dir_.empty()) {
+                    std::string dir = debug_dump_dir_.back() == '/' ? debug_dump_dir_ : debug_dump_dir_ + "/";
+                    char path[1024];
+                    snprintf(path, sizeof(path), "%scpp_talker_decode_step%03d_layer%02d_output.bin", dir.c_str(), step, m);
+                    FILE *fp = fopen(path, "wb");
+                    if (fp) {
+                        std::vector<unsigned short> l_out_bf16(_attr.tokens_embed_size);
+                        llm_d2h(l_out_bf16.data(), LLM_RADDR(cur_out), l_out_bf16.size() * sizeof(unsigned short), devid);
+                        std::vector<float> buf(_attr.tokens_embed_size);
+                        for (int d = 0; d < _attr.tokens_embed_size; ++d) buf[d] = bfloat16(l_out_bf16[d]).fp32();
+                        fwrite(buf.data(), sizeof(float), buf.size(), fp);
+                        fclose(fp);
+                    }
+                }
                 if (m == _attr.axmodel_num - 1)
                 {
                     auto &post_in = llama_post.get_input("input");
@@ -1160,7 +1236,12 @@
                 {
                     memcpy(t_mask.pVirAddr, mask.data(), std::min((size_t)t_mask.nSize, mask.size() * sizeof(unsigned short)));
                 }
-                auto &t_in = lyr.layer.get_input(decode_grpid, "input"); memcpy(t_in.pVirAddr, next_embed.data(), next_embed.size() * sizeof(unsigned short));
+                auto &t_in = lyr.layer.get_input(decode_grpid, "input");
+                if (m == 0) {
+                    memcpy(t_in.pVirAddr, next_embed.data(), next_embed.size() * sizeof(unsigned short));
+                } else {
+                    memcpy(t_in.pVirAddr, embed.data(), embed.size() * sizeof(unsigned short));
+                }
                 lyr.layer.inference(decode_grpid);
                 auto &out_k = lyr.layer.get_output(decode_grpid, "K_cache_out");
                 auto &out_v = lyr.layer.get_output(decode_grpid, "V_cache_out");
@@ -1175,6 +1256,19 @@
                     memcpy(in_v_ptr + indices * _attr.kv_cache_size, out_v.pVirAddr, sizeof(unsigned short) * _attr.kv_cache_size);
                 }
                 auto &t_out = lyr.layer.get_output(decode_grpid, "output"); memcpy(embed.data(), t_out.pVirAddr, embed.size() * sizeof(unsigned short));
+                // ---- Debug dump: all layer outputs for step 0 ----
+                if (step == 0 && !debug_dump_dir_.empty()) {
+                    std::string dir = debug_dump_dir_.back() == '/' ? debug_dump_dir_ : debug_dump_dir_ + "/";
+                    char path[1024];
+                    snprintf(path, sizeof(path), "%scpp_talker_decode_step%03d_layer%02d_output.bin", dir.c_str(), step, m);
+                    FILE *fp = fopen(path, "wb");
+                    if (fp) {
+                        std::vector<float> buf(_attr.tokens_embed_size);
+                        for (int d = 0; d < _attr.tokens_embed_size; ++d) buf[d] = bfloat16(((unsigned short *)t_out.pVirAddr)[d]).fp32();
+                        fwrite(buf.data(), sizeof(float), buf.size(), fp);
+                        fclose(fp);
+                    }
+                }
             }
             auto &t_in = llama_post.get_input("input"); memcpy(t_in.pVirAddr, embed.data(), embed.size() * sizeof(unsigned short));
             llama_post.inference(); auto &t_out = llama_post.get_output("output");

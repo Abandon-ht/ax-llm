@@ -189,14 +189,20 @@ if(BUILD_AX650)
     target_include_directories(qwen3_tts_debug PRIVATE ${BSP_MSP_DIR}/include)
     target_include_directories(qwen3_tts_ablation PRIVATE ${BSP_MSP_DIR}/include)
     target_include_directories(qwen3_tts_infer PRIVATE ${BSP_MSP_DIR}/include)
-    # ONNX Runtime headers for ablation tool
-    set(ONNXRUNTIME_INCLUDE_DIR /home/m5stack/Workspace/kaldi/sherpa-onnx/build-aarch64-linux-gnu/_deps/onnxruntime-src/include)
-    set(ONNXRUNTIME_LIB_DIR /home/m5stack/Workspace/kaldi/sherpa-onnx/build-aarch64-linux-gnu/_deps/onnxruntime-src/lib)
-    # set(ONNXRUNTIME_INCLUDE_DIR /Users/m5stack/Projects/kaldi/sherpa-onnx/build/_deps/onnxruntime-src/include)
-    # set(ONNXRUNTIME_LIB_DIR /Users/m5stack/Projects/kaldi/sherpa-onnx/build/_deps/onnxruntime-src/lib)
+    # ONNX Runtime for TTS tools (ablation + infer + debug)
+    set(ONNXRUNTIME_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/onnxruntime-linux-aarch64-1.26.0/include)
+    set(ONNXRUNTIME_LIB_DIR ${CMAKE_SOURCE_DIR}/onnxruntime-linux-aarch64-1.26.0/lib)
     if(EXISTS ${ONNXRUNTIME_INCLUDE_DIR}/onnxruntime_cxx_api.h)
+        target_include_directories(axllm PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
+        target_include_directories(llm_smoke PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
+        target_include_directories(qwen3_asr_debug PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
         target_include_directories(qwen3_tts_ablation PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
-        message(STATUS "ONNX Runtime found for qwen3_tts_ablation: ${ONNXRUNTIME_INCLUDE_DIR}")
+        target_include_directories(qwen3_tts_infer PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
+        target_include_directories(qwen3_tts_debug PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
+        target_compile_definitions(qwen3_tts_ablation PRIVATE USE_ONNX_RMSNORM)
+        target_compile_definitions(qwen3_tts_infer PRIVATE USE_ONNX_RMSNORM)
+        target_compile_definitions(qwen3_tts_debug PRIVATE USE_ONNX_RMSNORM)
+        message(STATUS "ONNX Runtime found: ${ONNXRUNTIME_INCLUDE_DIR}")
     else()
         message(FATAL_ERROR "ONNX Runtime headers not found at ${ONNXRUNTIME_INCLUDE_DIR}")
     endif()
@@ -235,6 +241,30 @@ if(BUILD_AX650)
         pthread tokenizer openai_api::server
         ${AXLLM_VISION_LIBS}
     )
+    target_link_libraries(qwen3_tts_infer
+        -L${BSP_MSP_DIR}/lib
+        -L${ONNXRUNTIME_LIB_DIR}
+        ax_engine ax_interpreter ax_sys
+        onnxruntime
+        pthread tokenizer openai_api::server
+        ${AXLLM_VISION_LIBS}
+    )
+    target_link_libraries(qwen3_tts_debug
+        -L${BSP_MSP_DIR}/lib
+        -L${ONNXRUNTIME_LIB_DIR}
+        ax_engine ax_interpreter ax_sys
+        onnxruntime
+        pthread tokenizer openai_api::server
+        ${AXLLM_VISION_LIBS}
+    )
+    # Set RPATH so binaries find libonnxruntime.so.1 in ../lib without LD_LIBRARY_PATH
+    set_target_properties(qwen3_tts_ablation qwen3_tts_infer qwen3_tts_debug
+        PROPERTIES INSTALL_RPATH "$ORIGIN/../lib"
+    )
+    # Install ONNX Runtime shared lib into lib/ (renamed to the SONAME expected by the linker)
+    install(FILES ${ONNXRUNTIME_LIB_DIR}/libonnxruntime.so.1.26.0
+            DESTINATION lib
+            RENAME libonnxruntime.so.1)
     target_link_libraries(qwen3_tts_infer
         -L${BSP_MSP_DIR}/lib
         ax_engine ax_interpreter ax_sys
